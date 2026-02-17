@@ -20,7 +20,7 @@ Implemented:
 
 - SvelteKit app scaffolded with TypeScript and Vite.
 - WebGPU 3D viewport using `three` WebGPU renderer, with WebGL fallback.
-- Knot preset generator (`T(p,q)` torus knots + random torus challenge).
+- Knot preset generator (planar 4-regular shadow generator + random shadow challenge).
 - Simple rod-like solver (stretch + bend + self-avoidance repulsion + edge collision correction).
 - Interactive drag controls on knot segments.
 - Approximate crossing-count estimator and live energy score.
@@ -40,6 +40,8 @@ Not yet implemented:
 - `src/lib/knot/presets.ts`: knot generators and challenge state creation.
 - `src/lib/knot/metrics.ts`: crossing-count estimator.
 - `docs/mvp-and-research.md`: architecture and source-backed research notes.
+- `docs/engine-study-plan.md`: phased cleanup/rebuild plan for generator + solver + interaction.
+- `docs/repulsive-surfaces-adaptation.md`: concrete mapping from Repulsive Surfaces ideas/code to this knot engine.
 
 ## Scripts
 

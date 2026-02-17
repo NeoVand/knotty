@@ -1,44 +1,37 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import {
-		KnotEngine,
-		PRESET_ORDER,
-		type KnotMetrics,
-		type KnotPresetName
-	} from '$lib/knot';
-
-	const PRESET_LABELS: Record<KnotPresetName, string> = {
-		trefoil: 'Trefoil T(2,3)',
-		cinquefoil: 'Cinquefoil T(2,5)',
-		septfoil: 'Septfoil T(2,7)',
-		random_torus: 'Random Torus'
-	};
+	import { onMount, tick } from 'svelte';
+	import { KnotEngine, type KnotMetrics } from '$lib/knot';
 
 	let viewport: HTMLDivElement | undefined;
 	let engine = $state<KnotEngine | null>(null);
 
-	let preset = $state<KnotPresetName>('trefoil');
-	let scrambleAmount = $state(0.62);
+	let crossingTarget = $state(9);
+	let seed = $state(newSeed());
 	let autoRelax = $state(true);
+	let solidLink = $state(true);
+	let colorizeLinks = $state(false);
 	let showControlPoints = $state(false);
+	let arcGuideLayout = $state(true);
+	let repulsionStrength = $state(1.0);
+	let smoothness = $state(0.62);
+	let relaxSpeed = $state(3);
+	let generating = $state(false);
 	let status = $state('Preparing WebGPU renderer...');
 	let bootError = $state<string | null>(null);
 	let metrics = $state<KnotMetrics>({
-		preset: 'trefoil',
-		label: 'Trefoil T(2,3)',
+		preset: 'random_shadow',
+		label: 'Shadow',
 		crossings: 0,
-		targetCrossings: 3,
+		targetCrossings: 9,
 		energy: 0,
-		nodeCount: 0
+		nodeCount: 0,
+		minClearance: Number.POSITIVE_INFINITY,
+		clearanceRatio: Number.POSITIVE_INFINITY,
+		maxLengthDrift: 0,
+		edgeUniformity: 1,
+		acceptedSteps: 0,
+		rejectedSteps: 0
 	});
-
-	function loadPreset(): void {
-		engine?.setPreset(preset, scrambleAmount);
-	}
-
-	function scramble(): void {
-		engine?.scramble(scrambleAmount);
-	}
 
 	function relaxStep(): void {
 		engine?.stepRelax(16);
@@ -48,9 +41,24 @@
 		engine?.showSolution();
 	}
 
-	function randomChallenge(): void {
-		preset = 'random_torus';
-		engine?.setPreset('random_torus', scrambleAmount);
+	async function generateChallenge(randomizeSeed: boolean): Promise<void> {
+		if (!engine || generating) return;
+		if (randomizeSeed) seed = newSeed();
+		const safeCrossings = clampInteger(crossingTarget, 3, 128);
+		crossingTarget = safeCrossings;
+		generating = true;
+		bootError = null;
+		status = `Generating ${safeCrossings}-crossing challenge...`;
+		await tick();
+		await waitFrame();
+
+		try {
+			engine.setCrossingChallenge(safeCrossings, seed);
+		} catch (error) {
+			bootError = error instanceof Error ? error.message : 'Failed to generate challenge.';
+		} finally {
+			generating = false;
+		}
 	}
 
 	$effect(() => {
@@ -59,6 +67,30 @@
 
 	$effect(() => {
 		if (engine) engine.setShowControlPoints(showControlPoints);
+	});
+
+	$effect(() => {
+		if (engine) engine.setSolidLink(solidLink);
+	});
+
+	$effect(() => {
+		if (engine) engine.setColorizeLinks(colorizeLinks);
+	});
+
+	$effect(() => {
+		if (engine) engine.setArcGuideLayout(arcGuideLayout);
+	});
+
+	$effect(() => {
+		if (engine) engine.setRepulsionStrength(repulsionStrength);
+	});
+
+	$effect(() => {
+		if (engine) engine.setRelaxSmoothness(smoothness);
+	});
+
+	$effect(() => {
+		if (engine) engine.setRelaxIterations(relaxSpeed);
 	});
 
 	onMount(() => {
@@ -80,8 +112,14 @@
 				await engine.init();
 				if (cancelled) return;
 				engine.setAutoRelax(autoRelax);
+				engine.setSolidLink(solidLink);
+				engine.setColorizeLinks(colorizeLinks);
 				engine.setShowControlPoints(showControlPoints);
-				engine.setPreset(preset, scrambleAmount);
+				engine.setArcGuideLayout(arcGuideLayout);
+				engine.setRepulsionStrength(repulsionStrength);
+				engine.setRelaxSmoothness(smoothness);
+				engine.setRelaxIterations(relaxSpeed);
+				await generateChallenge(false);
 				status = 'Drag the knot and reduce crossings toward the target.';
 			} catch (error) {
 				bootError =
@@ -99,6 +137,18 @@
 			engine = null;
 		};
 	});
+
+	function waitFrame(): Promise<void> {
+		return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+	}
+
+	function newSeed(): number {
+		return (Math.random() * 0xffffffff) >>> 0;
+	}
+
+	function clampInteger(value: number, min: number, max: number): number {
+		return Math.min(max, Math.max(min, Math.round(value)));
+	}
 </script>
 
 <main class="page">
@@ -111,37 +161,54 @@
 
 		<div class="controls">
 			<label>
-				Challenge knot
-				<select bind:value={preset}>
-					{#each PRESET_ORDER as option}
-						<option value={option}>{PRESET_LABELS[option]}</option>
-					{/each}
-				</select>
+				Target crossings
+				<input type="number" min="3" max="128" step="1" bind:value={crossingTarget} />
 			</label>
 
 			<label>
-				Scramble intensity: {scrambleAmount.toFixed(2)}
-				<input type="range" min="0" max="1.2" step="0.02" bind:value={scrambleAmount} />
+				Seed
+				<input type="number" min="1" max="4294967295" step="1" bind:value={seed} />
 			</label>
 
 			<div class="toggles">
 				<label><input type="checkbox" bind:checked={autoRelax} /> Auto relax</label>
+				<label><input type="checkbox" bind:checked={solidLink} /> Solid link</label>
+				<label><input type="checkbox" bind:checked={colorizeLinks} /> Colorize links</label>
 				<label><input type="checkbox" bind:checked={showControlPoints} /> Show control points</label>
+				<label><input type="checkbox" bind:checked={arcGuideLayout} /> Arc-guide layout</label>
 			</div>
 
+			<label>
+				Repulsion force: {repulsionStrength.toFixed(2)}
+				<input type="range" min="0.2" max="3.5" step="0.05" bind:value={repulsionStrength} />
+			</label>
+
+			<label>
+				Smoothness: {smoothness.toFixed(2)}
+				<input type="range" min="0" max="1" step="0.02" bind:value={smoothness} />
+			</label>
+
+			<label>
+				Relax speed: {relaxSpeed}
+				<input type="range" min="1" max="8" step="1" bind:value={relaxSpeed} />
+			</label>
+
 			<div class="actions">
-				<button onclick={loadPreset} disabled={!engine}>Load challenge</button>
-				<button onclick={scramble} disabled={!engine}>Scramble</button>
+				<button onclick={() => generateChallenge(false)} disabled={!engine || generating}>
+					{generating ? 'Generating...' : 'Generate'}
+				</button>
+				<button onclick={() => generateChallenge(true)} disabled={!engine || generating}>
+					New seed + generate
+				</button>
 				<button onclick={relaxStep} disabled={!engine}>Relax step</button>
 				<button onclick={showSolution} disabled={!engine}>Show solution</button>
-				<button class="accent" onclick={randomChallenge} disabled={!engine}>Random challenge</button>
 			</div>
 		</div>
 
-		<div class="stats">
-			<div>
-				<span>Current crossings</span>
-				<strong>{metrics.crossings}</strong>
+			<div class="stats">
+				<div>
+					<span>Current crossings</span>
+					<strong>{metrics.crossings}</strong>
 			</div>
 			<div>
 				<span>Target crossings</span>
@@ -151,11 +218,27 @@
 				<span>Energy</span>
 				<strong>{metrics.energy.toFixed(1)}</strong>
 			</div>
-			<div>
-				<span>Nodes</span>
-				<strong>{metrics.nodeCount}</strong>
+				<div>
+					<span>Nodes</span>
+					<strong>{metrics.nodeCount}</strong>
+				</div>
+				<div>
+					<span>Min clearance / (2r)</span>
+					<strong>{Number.isFinite(metrics.clearanceRatio) ? metrics.clearanceRatio.toFixed(2) : 'n/a'}</strong>
+				</div>
+				<div>
+					<span>Max length drift</span>
+					<strong>{(metrics.maxLengthDrift * 100).toFixed(2)}%</strong>
+				</div>
+				<div>
+					<span>Edge uniformity</span>
+					<strong>{metrics.edgeUniformity.toFixed(2)}x</strong>
+				</div>
+				<div>
+					<span>Line search</span>
+					<strong>{metrics.acceptedSteps}/{metrics.rejectedSteps}</strong>
+				</div>
 			</div>
-		</div>
 
 		<p class="status">{status}</p>
 		{#if bootError}
@@ -228,13 +311,13 @@
 		font-size: 0.88rem;
 	}
 
-	select,
+	input[type='number'],
 	input[type='range'],
 	button {
 		font-family: inherit;
 	}
 
-	select {
+	input[type='number'] {
 		background: rgba(8, 31, 27, 0.88);
 		color: #f3f7ec;
 		border: 1px solid rgba(117, 239, 211, 0.34);
@@ -283,11 +366,6 @@
 	button:disabled {
 		cursor: not-allowed;
 		opacity: 0.55;
-	}
-
-	button.accent {
-		background: rgba(126, 67, 19, 0.92);
-		border-color: rgba(255, 196, 117, 0.58);
 	}
 
 	.stats {

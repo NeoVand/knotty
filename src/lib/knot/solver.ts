@@ -10,8 +10,27 @@ export interface SolverOptions {
 	regularization: number;
 	highOrderWeight: number;
 	lowOrderWeight: number;
+	repulsionWeight: number;
+	bendingWeight: number;
+	smoothingWeight: number;
+	stretchWeight: number;
 	constraintPasses: number;
 	edgeCollisionPasses: number;
+	surfaceClearanceFactor: number;
+	surfaceNearFieldFactor: number;
+	surfaceBarrierWeight: number;
+	surfacePenetrationWeight: number;
+}
+
+export interface SolverDiagnostics {
+	lastStepAccepted: boolean;
+	lastAcceptedStepSize: number;
+	acceptedSteps: number;
+	rejectedSteps: number;
+	lastMinEdgeDistance: number;
+	lastClearanceRatio: number;
+	lastEnergyBefore: number;
+	lastEnergyAfter: number;
 }
 
 const DEFAULT_OPTIONS: SolverOptions = {
@@ -26,8 +45,16 @@ const DEFAULT_OPTIONS: SolverOptions = {
 	regularization: 2e-3,
 	highOrderWeight: 0.38,
 	lowOrderWeight: 1.0,
-	constraintPasses: 5,
-	edgeCollisionPasses: 2
+	repulsionWeight: 1.0,
+	bendingWeight: 26,
+	smoothingWeight: 0.1,
+	stretchWeight: 220,
+	constraintPasses: 8,
+	edgeCollisionPasses: 2,
+	surfaceClearanceFactor: 2.06,
+	surfaceNearFieldFactor: 1.6,
+	surfaceBarrierWeight: 1.5,
+	surfacePenetrationWeight: 240
 };
 
 interface SegmentContact {
@@ -39,11 +66,19 @@ interface SegmentContact {
 	dz: number;
 }
 
+interface EdgeHashData {
+	buckets: Map<string, number[]>;
+	ix: Int32Array;
+	iy: Int32Array;
+	iz: Int32Array;
+}
+
 export class KnotSolver {
 	private readonly nodeCount: number;
 	private readonly restLength: number;
-	private readonly options: SolverOptions;
+	private options: SolverOptions;
 	private lastStepSize = 0.018;
+	private keepCentered = true;
 
 	private readonly candidate: Float32Array;
 	private readonly tangents: Float32Array;
@@ -61,6 +96,20 @@ export class KnotSolver {
 	private readonly cgAp: Float32Array;
 	private readonly cgZ: Float32Array;
 	private readonly cgOut: Float32Array;
+	private readonly smoothBuffer: Float32Array;
+	private readonly edgeCellX: Int32Array;
+	private readonly edgeCellY: Int32Array;
+	private readonly edgeCellZ: Int32Array;
+	private readonly diagnostics: SolverDiagnostics = {
+		lastStepAccepted: false,
+		lastAcceptedStepSize: 0,
+		acceptedSteps: 0,
+		rejectedSteps: 0,
+		lastMinEdgeDistance: Number.POSITIVE_INFINITY,
+		lastClearanceRatio: Number.POSITIVE_INFINITY,
+		lastEnergyBefore: 0,
+		lastEnergyAfter: 0
+	};
 
 	constructor(nodeCount: number, restLength: number, options: Partial<SolverOptions> = {}) {
 		this.nodeCount = nodeCount;
@@ -84,19 +133,102 @@ export class KnotSolver {
 		this.cgAp = new Float32Array(nodeCount);
 		this.cgZ = new Float32Array(nodeCount);
 		this.cgOut = new Float32Array(nodeCount);
+		this.smoothBuffer = new Float32Array(vectorLength);
+		this.edgeCellX = new Int32Array(nodeCount);
+		this.edgeCellY = new Int32Array(nodeCount);
+		this.edgeCellZ = new Int32Array(nodeCount);
 	}
 
 	reset(): void {
 		this.lastStepSize = 0.018;
+		this.diagnostics.lastStepAccepted = false;
+		this.diagnostics.lastAcceptedStepSize = 0;
+		this.diagnostics.acceptedSteps = 0;
+		this.diagnostics.rejectedSteps = 0;
+		this.diagnostics.lastMinEdgeDistance = Number.POSITIVE_INFINITY;
+		this.diagnostics.lastClearanceRatio = Number.POSITIVE_INFINITY;
+		this.diagnostics.lastEnergyBefore = 0;
+		this.diagnostics.lastEnergyAfter = 0;
+	}
+
+	setTuning(
+		next: Partial<
+			Pick<
+				SolverOptions,
+				| 'repulsionWeight'
+				| 'smoothingWeight'
+				| 'highOrderWeight'
+				| 'bendingWeight'
+				| 'stretchWeight'
+				| 'surfaceBarrierWeight'
+				| 'surfacePenetrationWeight'
+				| 'surfaceNearFieldFactor'
+				| 'surfaceClearanceFactor'
+				| 'constraintPasses'
+				| 'edgeCollisionPasses'
+			>
+		>
+	): void {
+		if (next.repulsionWeight !== undefined) {
+			this.options.repulsionWeight = clamp(next.repulsionWeight, 0.1, 5);
+		}
+		if (next.smoothingWeight !== undefined) {
+			this.options.smoothingWeight = clamp(next.smoothingWeight, 0, 0.35);
+		}
+		if (next.highOrderWeight !== undefined) {
+			this.options.highOrderWeight = clamp(next.highOrderWeight, 0.08, 1.2);
+		}
+		if (next.bendingWeight !== undefined) {
+			this.options.bendingWeight = clamp(next.bendingWeight, 0, 220);
+		}
+		if (next.stretchWeight !== undefined) {
+			this.options.stretchWeight = clamp(next.stretchWeight, 40, 900);
+		}
+		if (next.surfaceBarrierWeight !== undefined) {
+			this.options.surfaceBarrierWeight = clamp(next.surfaceBarrierWeight, 0, 8);
+		}
+		if (next.surfacePenetrationWeight !== undefined) {
+			this.options.surfacePenetrationWeight = clamp(next.surfacePenetrationWeight, 20, 1200);
+		}
+		if (next.surfaceNearFieldFactor !== undefined) {
+			this.options.surfaceNearFieldFactor = clamp(next.surfaceNearFieldFactor, 1.05, 3.2);
+		}
+		if (next.surfaceClearanceFactor !== undefined) {
+			this.options.surfaceClearanceFactor = clamp(next.surfaceClearanceFactor, 1.8, 3.2);
+		}
+		if (next.constraintPasses !== undefined) {
+			this.options.constraintPasses = clamp(Math.round(next.constraintPasses), 2, 28);
+		}
+		if (next.edgeCollisionPasses !== undefined) {
+			this.options.edgeCollisionPasses = clamp(Math.round(next.edgeCollisionPasses), 1, 8);
+		}
+	}
+
+	setKeepCentered(value: boolean): void {
+		this.keepCentered = value;
+	}
+
+	getDiagnostics(): SolverDiagnostics {
+		return { ...this.diagnostics };
 	}
 
 	zeroVelocity(_index: number): void {
 		// No-op: this solver integrates a constrained descent direction directly.
 	}
 
+	enforceInextensibility(points: Float32Array, pinnedIndex: number | null, thickness: number, passes = 1): void {
+		const totalPasses = Math.max(1, Math.round(passes));
+		for (let i = 0; i < totalPasses; i += 1) {
+			this.applyDistanceConstraints(points, pinnedIndex);
+			this.applyEdgeCollisions(points, pinnedIndex, thickness);
+			this.applyDistanceConstraints(points, pinnedIndex);
+		}
+	}
+
 	step(points: Float32Array, dt: number, pinnedIndex: number | null, thickness: number): void {
 		const baseEnergy = this.measureEnergy(points, thickness);
-		this.fillL2Gradient(points);
+		this.diagnostics.lastEnergyBefore = baseEnergy;
+		this.fillL2Gradient(points, thickness);
 		zeroPinnedVector(this.l2Gradient, pinnedIndex);
 		if (pinnedIndex === null) removeMean(this.l2Gradient);
 
@@ -120,8 +252,10 @@ export class KnotSolver {
 			}
 
 			this.applyDistanceConstraints(this.candidate, pinnedIndex);
-			this.applyEdgeCollisions(this.candidate, pinnedIndex, thickness * 1.08);
-			if (pinnedIndex === null) recenter(this.candidate, this.nodeCount);
+			this.applyEdgeCollisions(this.candidate, pinnedIndex, thickness);
+			this.applyCurveSmoothing(this.candidate, pinnedIndex);
+			this.applyDistanceConstraints(this.candidate, pinnedIndex);
+			if (pinnedIndex === null && this.keepCentered) recenter(this.candidate, this.nodeCount);
 
 			const nextEnergy = this.measureEnergy(this.candidate, thickness);
 			const armijoTarget = baseEnergy - this.options.armijo * stepSize * Math.max(1e-8, gradDotDirection);
@@ -129,6 +263,10 @@ export class KnotSolver {
 			if (nextEnergy < baseEnergy || nextEnergy <= armijoTarget) {
 				points.set(this.candidate);
 				this.lastStepSize = stepSize;
+				this.diagnostics.lastEnergyAfter = nextEnergy;
+				this.diagnostics.lastStepAccepted = true;
+				this.diagnostics.lastAcceptedStepSize = stepSize;
+				this.diagnostics.acceptedSteps += 1;
 				accepted = true;
 				break;
 			}
@@ -137,16 +275,24 @@ export class KnotSolver {
 			if (stepSize < this.options.minStep) break;
 		}
 
-		if (!accepted) this.lastStepSize = Math.max(this.options.minStep, this.lastStepSize * 0.6);
+		if (!accepted) {
+			this.lastStepSize = Math.max(this.options.minStep, this.lastStepSize * 0.6);
+			this.diagnostics.lastEnergyAfter = baseEnergy;
+			this.diagnostics.lastStepAccepted = false;
+			this.diagnostics.rejectedSteps += 1;
+		}
+
+		const minEdgeDistance = this.measureMinEdgeDistance(points);
+		const clearance = thickness * this.options.surfaceClearanceFactor;
+		this.diagnostics.lastMinEdgeDistance = minEdgeDistance;
+		this.diagnostics.lastClearanceRatio = minEdgeDistance / Math.max(1e-6, clearance);
 	}
 
 	measureEnergy(points: Float32Array, thickness: number): number {
 		this.updateCurveFrames(points);
-		const { alpha, beta } = this.options;
+		const { alpha, beta, repulsionWeight } = this.options;
 		let energy = 0;
 		let stretchPenalty = 0;
-		let collisionPenalty = 0;
-		const minDistance = Math.max(1e-4, thickness * 1.22);
 
 		for (let i = 0; i < this.nodeCount; i += 1) {
 			const lenDiff = this.edgeLengths[i] - this.restLength;
@@ -181,22 +327,24 @@ export class KnotSolver {
 
 				const weight = this.dualLengths[i] * this.dualLengths[j];
 				const invDistBeta = 1 / Math.pow(dist, beta);
-				energy += weight * (Math.pow(normI, alpha) + Math.pow(normJ, alpha)) * invDistBeta;
-
-				if (dist < minDistance) {
-					const penetration = minDistance - dist;
-					collisionPenalty += penetration * penetration;
-				}
+				energy += repulsionWeight * weight * (Math.pow(normI, alpha) + Math.pow(normJ, alpha)) * invDistBeta;
 			}
 		}
 
-		return energy + 28 * stretchPenalty + 120 * collisionPenalty;
+		const surfaceBarrierPenalty = this.measureSurfaceBarrierEnergy(points, thickness);
+		const bendingPenalty = this.measureBendingEnergy(points);
+		return (
+			energy +
+			this.options.stretchWeight * stretchPenalty +
+			this.options.bendingWeight * bendingPenalty +
+			surfaceBarrierPenalty
+		);
 	}
 
-	private fillL2Gradient(points: Float32Array): void {
+	private fillL2Gradient(points: Float32Array, thickness: number): void {
 		this.updateCurveFrames(points);
 		this.l2Gradient.fill(0);
-		const { alpha, beta } = this.options;
+		const { alpha, beta, repulsionWeight } = this.options;
 
 		for (let i = 0; i < this.nodeCount; i += 1) {
 			const pi = i * 3;
@@ -240,9 +388,9 @@ export class KnotSolver {
 				);
 
 				const weight = this.dualLengths[i] * this.dualLengths[j];
-				const gx = weight * (gradIx[0] + gradJx[0]);
-				const gy = weight * (gradIx[1] + gradJx[1]);
-				const gz = weight * (gradIx[2] + gradJx[2]);
+				const gx = repulsionWeight * weight * (gradIx[0] + gradJx[0]);
+				const gy = repulsionWeight * weight * (gradIx[1] + gradJx[1]);
+				const gz = repulsionWeight * weight * (gradIx[2] + gradJx[2]);
 
 				this.l2Gradient[pi] += gx;
 				this.l2Gradient[pi + 1] += gy;
@@ -252,14 +400,18 @@ export class KnotSolver {
 				this.l2Gradient[pj + 2] -= gz;
 			}
 		}
+
+		this.addStretchGradient(points);
+		this.addBendingGradient(points);
+		this.addSurfaceBarrierGradient(points, thickness);
 	}
 
 	private buildPreconditioner(points: Float32Array, thickness: number): void {
 		this.updateCurveFrames(points);
-		const { alpha, beta, lowOrderWeight, regularization, highOrderWeight } = this.options;
+		const { alpha, beta, lowOrderWeight, regularization, highOrderWeight, repulsionWeight } = this.options;
 		const sigma = (beta - 1) / alpha - 1;
 		const n = this.nodeCount;
-		const minDist = Math.max(thickness * 0.85, 1e-3);
+		const minDist = Math.max(thickness * 2.0, 1e-3);
 
 		this.pairWeights.fill(0);
 		this.rowSums.fill(0);
@@ -283,6 +435,7 @@ export class KnotSolver {
 				const kJ = kernel24(dx, dy, dz, this.tangents[tj], this.tangents[tj + 1], this.tangents[tj + 2], safeDist);
 				const kSym = 0.5 * (kI + kJ);
 				const weight =
+					repulsionWeight *
 					lowOrderWeight *
 					this.dualLengths[i] *
 					this.dualLengths[j] *
@@ -381,66 +534,322 @@ export class KnotSolver {
 		}
 	}
 
-	private applyEdgeCollisions(points: Float32Array, pinnedIndex: number | null, thickness: number): void {
+	private applyEdgeCollisions(points: Float32Array, pinnedIndex: number | null, tubeRadius: number): void {
 		const passes = this.options.edgeCollisionPasses;
+		const clearance = tubeRadius * this.options.surfaceClearanceFactor;
+		const nearField = clearance * this.options.surfaceNearFieldFactor;
+		const softness = Math.max(1e-4, nearField - clearance);
+
 		for (let pass = 0; pass < passes; pass += 1) {
-			for (let edgeA = 0; edgeA < this.nodeCount; edgeA += 1) {
+			this.forEachPotentialEdgePair(points, nearField, (edgeA, edgeB) => {
 				const edgeANext = (edgeA + 1) % this.nodeCount;
-				for (let edgeB = edgeA + 1; edgeB < this.nodeCount; edgeB += 1) {
-					const edgeBNext = (edgeB + 1) % this.nodeCount;
-					if (areAdjacentEdges(edgeA, edgeB, this.nodeCount)) continue;
+				const edgeBNext = (edgeB + 1) % this.nodeCount;
+				const contact = closestPointsBetweenEdges(points, edgeA, edgeANext, edgeB, edgeBNext);
+				const dist = Math.sqrt(contact.distSq);
+				if (!Number.isFinite(dist) || dist >= nearField) return;
 
-					const contact = closestPointsBetweenEdges(points, edgeA, edgeANext, edgeB, edgeBNext);
-					const dist = Math.sqrt(contact.distSq);
-					if (!Number.isFinite(dist) || dist >= thickness) continue;
+				let nx = contact.dx;
+				let ny = contact.dy;
+				let nz = contact.dz;
+				let normalLength = Math.hypot(nx, ny, nz);
+				if (normalLength < 1e-7) {
+					nx = points[edgeANext * 3] - points[edgeA * 3];
+					ny = points[edgeANext * 3 + 1] - points[edgeA * 3 + 1];
+					nz = points[edgeANext * 3 + 2] - points[edgeA * 3 + 2];
+					normalLength = Math.hypot(nx, ny, nz) || 1;
+				}
+				nx /= normalLength;
+				ny /= normalLength;
+				nz /= normalLength;
 
-					let nx = contact.dx;
-					let ny = contact.dy;
-					let nz = contact.dz;
-					let normalLength = Math.hypot(nx, ny, nz);
-					if (normalLength < 1e-7) {
-						nx = points[edgeANext * 3] - points[edgeA * 3];
-						ny = points[edgeANext * 3 + 1] - points[edgeA * 3 + 1];
-						nz = points[edgeANext * 3 + 2] - points[edgeA * 3 + 2];
-						normalLength = Math.hypot(nx, ny, nz) || 1;
+				let push = 0;
+				if (dist < clearance) {
+					push = (clearance - dist) * 0.52;
+				} else {
+					const blend = (nearField - dist) / softness;
+					push = clearance * blend * blend * 0.025;
+				}
+				if (push <= 0) return;
+
+				const a0 = 1 - contact.s;
+				const a1 = contact.s;
+				const b0 = 1 - contact.t;
+				const b1 = contact.t;
+
+				applyPointDisplacement(points, edgeA, nx * push * a0, ny * push * a0, nz * push * a0, pinnedIndex);
+				applyPointDisplacement(points, edgeANext, nx * push * a1, ny * push * a1, nz * push * a1, pinnedIndex);
+				applyPointDisplacement(points, edgeB, -nx * push * b0, -ny * push * b0, -nz * push * b0, pinnedIndex);
+				applyPointDisplacement(
+					points,
+					edgeBNext,
+					-nx * push * b1,
+					-ny * push * b1,
+					-nz * push * b1,
+					pinnedIndex
+				);
+			});
+		}
+	}
+
+	private measureSurfaceBarrierEnergy(points: Float32Array, tubeRadius: number): number {
+		const clearance = tubeRadius * this.options.surfaceClearanceFactor;
+		const nearField = clearance * this.options.surfaceNearFieldFactor;
+		const softness = Math.max(1e-4, nearField - clearance);
+		let energy = 0;
+
+		this.forEachPotentialEdgePair(points, nearField, (edgeA, edgeB) => {
+			const edgeANext = (edgeA + 1) % this.nodeCount;
+			const edgeBNext = (edgeB + 1) % this.nodeCount;
+			const contact = closestPointsBetweenEdges(points, edgeA, edgeANext, edgeB, edgeBNext);
+			const dist = Math.sqrt(contact.distSq);
+			if (!Number.isFinite(dist) || dist >= nearField) return;
+
+			if (dist < clearance) {
+				const penetration = clearance - dist;
+				energy += this.options.surfacePenetrationWeight * penetration * penetration;
+				return;
+			}
+
+			const blend = (nearField - dist) / softness;
+			energy += this.options.surfaceBarrierWeight * blend * blend * blend;
+		});
+
+		return energy;
+	}
+
+	private addSurfaceBarrierGradient(points: Float32Array, tubeRadius: number): void {
+		const clearance = tubeRadius * this.options.surfaceClearanceFactor;
+		const nearField = clearance * this.options.surfaceNearFieldFactor;
+		const softness = Math.max(1e-4, nearField - clearance);
+
+		this.forEachPotentialEdgePair(points, nearField, (edgeA, edgeB) => {
+			const edgeANext = (edgeA + 1) % this.nodeCount;
+			const edgeBNext = (edgeB + 1) % this.nodeCount;
+			const contact = closestPointsBetweenEdges(points, edgeA, edgeANext, edgeB, edgeBNext);
+			const dist = Math.sqrt(contact.distSq);
+			if (!Number.isFinite(dist) || dist >= nearField) return;
+
+			let nx = contact.dx;
+			let ny = contact.dy;
+			let nz = contact.dz;
+			let normalLength = Math.hypot(nx, ny, nz);
+			if (normalLength < 1e-7) {
+				nx = points[edgeANext * 3] - points[edgeA * 3];
+				ny = points[edgeANext * 3 + 1] - points[edgeA * 3 + 1];
+				nz = points[edgeANext * 3 + 2] - points[edgeA * 3 + 2];
+				normalLength = Math.hypot(nx, ny, nz) || 1;
+			}
+			nx /= normalLength;
+			ny /= normalLength;
+			nz /= normalLength;
+
+			let magnitude = 0;
+			if (dist < clearance) {
+				magnitude = this.options.surfacePenetrationWeight * 2 * (clearance - dist);
+			} else {
+				const blend = (nearField - dist) / softness;
+				magnitude = (this.options.surfaceBarrierWeight * 3 * blend * blend) / softness;
+			}
+			if (!Number.isFinite(magnitude) || magnitude <= 0) return;
+
+			const a0 = 1 - contact.s;
+			const a1 = contact.s;
+			const b0 = 1 - contact.t;
+			const b1 = contact.t;
+
+			applyGradientContribution(
+				this.l2Gradient,
+				edgeA,
+				-nx * magnitude * a0,
+				-ny * magnitude * a0,
+				-nz * magnitude * a0
+			);
+			applyGradientContribution(
+				this.l2Gradient,
+				edgeANext,
+				-nx * magnitude * a1,
+				-ny * magnitude * a1,
+				-nz * magnitude * a1
+			);
+			applyGradientContribution(
+				this.l2Gradient,
+				edgeB,
+				nx * magnitude * b0,
+				ny * magnitude * b0,
+				nz * magnitude * b0
+			);
+			applyGradientContribution(
+				this.l2Gradient,
+				edgeBNext,
+				nx * magnitude * b1,
+				ny * magnitude * b1,
+				nz * magnitude * b1
+			);
+		});
+	}
+
+	private measureMinEdgeDistance(points: Float32Array): number {
+		let minDistance = Number.POSITIVE_INFINITY;
+		for (let edgeA = 0; edgeA < this.nodeCount; edgeA += 1) {
+			const edgeANext = (edgeA + 1) % this.nodeCount;
+			for (let edgeB = edgeA + 1; edgeB < this.nodeCount; edgeB += 1) {
+				if (areAdjacentEdges(edgeA, edgeB, this.nodeCount)) continue;
+				const edgeBNext = (edgeB + 1) % this.nodeCount;
+				const contact = closestPointsBetweenEdges(points, edgeA, edgeANext, edgeB, edgeBNext);
+				const dist = Math.sqrt(contact.distSq);
+				if (!Number.isFinite(dist)) continue;
+				if (dist < minDistance) minDistance = dist;
+			}
+		}
+		return minDistance;
+	}
+
+	private forEachPotentialEdgePair(points: Float32Array, searchRadius: number, visitor: (a: number, b: number) => void): void {
+		if (this.nodeCount < 4) return;
+		const hash = this.buildEdgeHash(points, searchRadius);
+		for (let edgeA = 0; edgeA < this.nodeCount; edgeA += 1) {
+			const cellX = hash.ix[edgeA];
+			const cellY = hash.iy[edgeA];
+			const cellZ = hash.iz[edgeA];
+			for (let dx = -1; dx <= 1; dx += 1) {
+				for (let dy = -1; dy <= 1; dy += 1) {
+					for (let dz = -1; dz <= 1; dz += 1) {
+						const bucket = hash.buckets.get(edgeCellKey(cellX + dx, cellY + dy, cellZ + dz));
+						if (!bucket) continue;
+						for (let k = 0; k < bucket.length; k += 1) {
+							const edgeB = bucket[k];
+							if (edgeB <= edgeA) continue;
+							if (areAdjacentEdges(edgeA, edgeB, this.nodeCount)) continue;
+							visitor(edgeA, edgeB);
+						}
 					}
-					nx /= normalLength;
-					ny /= normalLength;
-					nz /= normalLength;
-
-					const push = (thickness - dist) * 0.5;
-					const a0 = 1 - contact.s;
-					const a1 = contact.s;
-					const b0 = 1 - contact.t;
-					const b1 = contact.t;
-
-					applyPointDisplacement(points, edgeA, nx * push * a0, ny * push * a0, nz * push * a0, pinnedIndex);
-					applyPointDisplacement(
-						points,
-						edgeANext,
-						nx * push * a1,
-						ny * push * a1,
-						nz * push * a1,
-						pinnedIndex
-					);
-					applyPointDisplacement(
-						points,
-						edgeB,
-						-nx * push * b0,
-						-ny * push * b0,
-						-nz * push * b0,
-						pinnedIndex
-					);
-					applyPointDisplacement(
-						points,
-						edgeBNext,
-						-nx * push * b1,
-						-ny * push * b1,
-						-nz * push * b1,
-						pinnedIndex
-					);
 				}
 			}
+		}
+	}
+
+	private buildEdgeHash(points: Float32Array, searchRadius: number): EdgeHashData {
+		const cellSize = Math.max(1e-4, searchRadius);
+		const invCellSize = 1 / cellSize;
+		const buckets = new Map<string, number[]>();
+		for (let edge = 0; edge < this.nodeCount; edge += 1) {
+			const edgeNext = (edge + 1) % this.nodeCount;
+			const a = edge * 3;
+			const b = edgeNext * 3;
+			const mx = (points[a] + points[b]) * 0.5;
+			const my = (points[a + 1] + points[b + 1]) * 0.5;
+			const mz = (points[a + 2] + points[b + 2]) * 0.5;
+			const ix = Math.floor(mx * invCellSize);
+			const iy = Math.floor(my * invCellSize);
+			const iz = Math.floor(mz * invCellSize);
+			this.edgeCellX[edge] = ix;
+			this.edgeCellY[edge] = iy;
+			this.edgeCellZ[edge] = iz;
+			const key = edgeCellKey(ix, iy, iz);
+			const bucket = buckets.get(key);
+			if (bucket) bucket.push(edge);
+			else buckets.set(key, [edge]);
+		}
+		return {
+			buckets,
+			ix: this.edgeCellX,
+			iy: this.edgeCellY,
+			iz: this.edgeCellZ
+		};
+	}
+
+	private applyCurveSmoothing(points: Float32Array, pinnedIndex: number | null): void {
+		const weight = this.options.smoothingWeight;
+		if (weight <= 1e-6) return;
+		const n = this.nodeCount;
+		this.smoothBuffer.set(points);
+		for (let i = 0; i < n; i += 1) {
+			if (i === pinnedIndex) continue;
+			const im1 = (i - 1 + n) % n;
+			const ip1 = (i + 1) % n;
+			const base = i * 3;
+			const pBase = im1 * 3;
+			const nBase = ip1 * 3;
+			this.smoothBuffer[base] =
+				points[base] + weight * (0.5 * (points[pBase] + points[nBase]) - points[base]);
+			this.smoothBuffer[base + 1] =
+				points[base + 1] +
+				weight * (0.5 * (points[pBase + 1] + points[nBase + 1]) - points[base + 1]);
+			this.smoothBuffer[base + 2] =
+				points[base + 2] +
+				weight * (0.5 * (points[pBase + 2] + points[nBase + 2]) - points[base + 2]);
+		}
+		points.set(this.smoothBuffer);
+	}
+
+	private addStretchGradient(points: Float32Array): void {
+		const weight = this.options.stretchWeight * 2;
+		for (let i = 0; i < this.nodeCount; i += 1) {
+			const j = (i + 1) % this.nodeCount;
+			const ia = i * 3;
+			const ja = j * 3;
+			const dx = points[ia] - points[ja];
+			const dy = points[ia + 1] - points[ja + 1];
+			const dz = points[ia + 2] - points[ja + 2];
+			const dist = Math.hypot(dx, dy, dz) + 1e-8;
+			const diff = dist - this.restLength;
+			const coeff = (weight * diff) / dist;
+			const gx = coeff * dx;
+			const gy = coeff * dy;
+			const gz = coeff * dz;
+			this.l2Gradient[ia] += gx;
+			this.l2Gradient[ia + 1] += gy;
+			this.l2Gradient[ia + 2] += gz;
+			this.l2Gradient[ja] -= gx;
+			this.l2Gradient[ja + 1] -= gy;
+			this.l2Gradient[ja + 2] -= gz;
+		}
+	}
+
+	private measureBendingEnergy(points: Float32Array): number {
+		if (this.options.bendingWeight <= 1e-8) return 0;
+		let energy = 0;
+		const n = this.nodeCount;
+		for (let i = 0; i < n; i += 1) {
+			const im1 = (i - 1 + n) % n;
+			const ip1 = (i + 1) % n;
+			const iBase = i * 3;
+			const pBase = im1 * 3;
+			const nBase = ip1 * 3;
+			const ddx = points[pBase] - 2 * points[iBase] + points[nBase];
+			const ddy = points[pBase + 1] - 2 * points[iBase + 1] + points[nBase + 1];
+			const ddz = points[pBase + 2] - 2 * points[iBase + 2] + points[nBase + 2];
+			energy += ddx * ddx + ddy * ddy + ddz * ddz;
+		}
+		return energy;
+	}
+
+	private addBendingGradient(points: Float32Array): void {
+		const bendWeight = this.options.bendingWeight;
+		if (bendWeight <= 1e-8) return;
+		const coeff = bendWeight * 2;
+		const n = this.nodeCount;
+		for (let i = 0; i < n; i += 1) {
+			const im1 = (i - 1 + n) % n;
+			const ip1 = (i + 1) % n;
+			const iBase = i * 3;
+			const pBase = im1 * 3;
+			const nBase = ip1 * 3;
+			const ddx = points[pBase] - 2 * points[iBase] + points[nBase];
+			const ddy = points[pBase + 1] - 2 * points[iBase + 1] + points[nBase + 1];
+			const ddz = points[pBase + 2] - 2 * points[iBase + 2] + points[nBase + 2];
+
+			this.l2Gradient[pBase] += coeff * ddx;
+			this.l2Gradient[pBase + 1] += coeff * ddy;
+			this.l2Gradient[pBase + 2] += coeff * ddz;
+
+			this.l2Gradient[iBase] -= coeff * 2 * ddx;
+			this.l2Gradient[iBase + 1] -= coeff * 2 * ddy;
+			this.l2Gradient[iBase + 2] -= coeff * 2 * ddz;
+
+			this.l2Gradient[nBase] += coeff * ddx;
+			this.l2Gradient[nBase + 1] += coeff * ddy;
+			this.l2Gradient[nBase + 2] += coeff * ddz;
 		}
 	}
 
@@ -693,11 +1102,28 @@ function applyPointDisplacement(
 	points[idx + 2] += dz;
 }
 
+function applyGradientContribution(
+	gradient: Float32Array,
+	index: number,
+	dx: number,
+	dy: number,
+	dz: number
+): void {
+	const idx = index * 3;
+	gradient[idx] += dx;
+	gradient[idx + 1] += dy;
+	gradient[idx + 2] += dz;
+}
+
 function areAdjacentEdges(a: number, b: number, count: number): boolean {
 	if (a === b) return true;
 	const aNext = (a + 1) % count;
 	const bNext = (b + 1) % count;
 	return a === bNext || b === aNext;
+}
+
+function edgeCellKey(ix: number, iy: number, iz: number): string {
+	return `${ix},${iy},${iz}`;
 }
 
 function closestPointsBetweenEdges(
