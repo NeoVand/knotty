@@ -75,7 +75,9 @@ interface EdgeHashData {
 
 export class KnotSolver {
 	private readonly nodeCount: number;
-	private readonly restLength: number;
+	private readonly baseRestLength: number;
+	private restLength: number;
+	private targetRestLength: number;
 	private options: SolverOptions;
 	private lastStepSize = 0.018;
 	private keepCentered = true;
@@ -113,7 +115,9 @@ export class KnotSolver {
 
 	constructor(nodeCount: number, restLength: number, options: Partial<SolverOptions> = {}) {
 		this.nodeCount = nodeCount;
+		this.baseRestLength = restLength;
 		this.restLength = restLength;
+		this.targetRestLength = restLength;
 		this.options = { ...DEFAULT_OPTIONS, ...options };
 
 		const vectorLength = nodeCount * 3;
@@ -208,6 +212,19 @@ export class KnotSolver {
 		this.keepCentered = value;
 	}
 
+	setRestLengthScale(scale: number): void {
+		const safeScale = clamp(scale, 0.6, 1.25);
+		this.targetRestLength = this.baseRestLength * safeScale;
+	}
+
+	getCurrentRestLength(): number {
+		return this.restLength;
+	}
+
+	getTargetRestLength(): number {
+		return this.targetRestLength;
+	}
+
 	getDiagnostics(): SolverDiagnostics {
 		return { ...this.diagnostics };
 	}
@@ -226,6 +243,7 @@ export class KnotSolver {
 	}
 
 	step(points: Float32Array, dt: number, pinnedIndex: number | null, thickness: number): void {
+		this.restLength += (this.targetRestLength - this.restLength) * 0.14;
 		const baseEnergy = this.measureEnergy(points, thickness);
 		this.diagnostics.lastEnergyBefore = baseEnergy;
 		this.fillL2Gradient(points, thickness);
@@ -255,7 +273,7 @@ export class KnotSolver {
 			this.applyEdgeCollisions(this.candidate, pinnedIndex, thickness);
 			this.applyCurveSmoothing(this.candidate, pinnedIndex);
 			this.applyDistanceConstraints(this.candidate, pinnedIndex);
-			if (pinnedIndex === null && this.keepCentered) recenter(this.candidate, this.nodeCount);
+			if (pinnedIndex === null && this.keepCentered) recenter(this.candidate, this.nodeCount, 0.03);
 
 			const nextEnergy = this.measureEnergy(this.candidate, thickness);
 			const armijoTarget = baseEnergy - this.options.armijo * stepSize * Math.max(1e-8, gradDotDirection);
@@ -548,19 +566,10 @@ export class KnotSolver {
 				const dist = Math.sqrt(contact.distSq);
 				if (!Number.isFinite(dist) || dist >= nearField) return;
 
-				let nx = contact.dx;
-				let ny = contact.dy;
-				let nz = contact.dz;
-				let normalLength = Math.hypot(nx, ny, nz);
-				if (normalLength < 1e-7) {
-					nx = points[edgeANext * 3] - points[edgeA * 3];
-					ny = points[edgeANext * 3 + 1] - points[edgeA * 3 + 1];
-					nz = points[edgeANext * 3 + 2] - points[edgeA * 3 + 2];
-					normalLength = Math.hypot(nx, ny, nz) || 1;
-				}
-				nx /= normalLength;
-				ny /= normalLength;
-				nz /= normalLength;
+				const normal = separationNormalFromEdgePair(points, edgeA, edgeANext, edgeB, edgeBNext, contact);
+				const nx = normal[0];
+				const ny = normal[1];
+				const nz = normal[2];
 
 				let push = 0;
 				if (dist < clearance) {
@@ -629,19 +638,10 @@ export class KnotSolver {
 			const dist = Math.sqrt(contact.distSq);
 			if (!Number.isFinite(dist) || dist >= nearField) return;
 
-			let nx = contact.dx;
-			let ny = contact.dy;
-			let nz = contact.dz;
-			let normalLength = Math.hypot(nx, ny, nz);
-			if (normalLength < 1e-7) {
-				nx = points[edgeANext * 3] - points[edgeA * 3];
-				ny = points[edgeANext * 3 + 1] - points[edgeA * 3 + 1];
-				nz = points[edgeANext * 3 + 2] - points[edgeA * 3 + 2];
-				normalLength = Math.hypot(nx, ny, nz) || 1;
-			}
-			nx /= normalLength;
-			ny /= normalLength;
-			nz /= normalLength;
+			const normal = separationNormalFromEdgePair(points, edgeA, edgeANext, edgeB, edgeBNext, contact);
+			const nx = normal[0];
+			const ny = normal[1];
+			const nz = normal[2];
 
 			let magnitude = 0;
 			if (dist < clearance) {
@@ -1057,7 +1057,9 @@ function scale(v: Float32Array, factor: number): void {
 	for (let i = 0; i < v.length; i += 1) v[i] *= factor;
 }
 
-function recenter(points: Float32Array, count: number): void {
+function recenter(points: Float32Array, count: number, blend = 1): void {
+	const alpha = clamp(blend, 0, 1);
+	if (alpha <= 0) return;
 	let cx = 0;
 	let cy = 0;
 	let cz = 0;
@@ -1072,15 +1074,90 @@ function recenter(points: Float32Array, count: number): void {
 	cz /= count;
 	for (let i = 0; i < count; i += 1) {
 		const idx = i * 3;
-		points[idx] -= cx;
-		points[idx + 1] -= cy;
-		points[idx + 2] -= cz;
+		points[idx] -= cx * alpha;
+		points[idx + 1] -= cy * alpha;
+		points[idx + 2] -= cz * alpha;
 	}
 }
 
 function ringDistance(a: number, b: number, count: number): number {
 	const diff = Math.abs(a - b);
 	return Math.min(diff, count - diff);
+}
+
+function separationNormalFromEdgePair(
+	points: Float32Array,
+	a0: number,
+	a1: number,
+	b0: number,
+	b1: number,
+	contact: SegmentContact
+): [number, number, number] {
+	let nx = contact.dx;
+	let ny = contact.dy;
+	let nz = contact.dz;
+	let nLen = Math.hypot(nx, ny, nz);
+	if (nLen > 1e-7) {
+		return [nx / nLen, ny / nLen, nz / nLen];
+	}
+
+	const a0b = a0 * 3;
+	const a1b = a1 * 3;
+	const b0b = b0 * 3;
+	const b1b = b1 * 3;
+	const ax = points[a1b] - points[a0b];
+	const ay = points[a1b + 1] - points[a0b + 1];
+	const az = points[a1b + 2] - points[a0b + 2];
+	const bx = points[b1b] - points[b0b];
+	const by = points[b1b + 1] - points[b0b + 1];
+	const bz = points[b1b + 2] - points[b0b + 2];
+
+	nx = ay * bz - az * by;
+	ny = az * bx - ax * bz;
+	nz = ax * by - ay * bx;
+	nLen = Math.hypot(nx, ny, nz);
+	if (nLen > 1e-7) return [nx / nLen, ny / nLen, nz / nLen];
+
+	const amx = (points[a0b] + points[a1b]) * 0.5;
+	const amy = (points[a0b + 1] + points[a1b + 1]) * 0.5;
+	const amz = (points[a0b + 2] + points[a1b + 2]) * 0.5;
+	const bmx = (points[b0b] + points[b1b]) * 0.5;
+	const bmy = (points[b0b + 1] + points[b1b + 1]) * 0.5;
+	const bmz = (points[b0b + 2] + points[b1b + 2]) * 0.5;
+	nx = amx - bmx;
+	ny = amy - bmy;
+	nz = amz - bmz;
+	nLen = Math.hypot(nx, ny, nz);
+	if (nLen > 1e-7) return [nx / nLen, ny / nLen, nz / nLen];
+
+	return orthogonalDirection(ax, ay, az);
+}
+
+function orthogonalDirection(x: number, y: number, z: number): [number, number, number] {
+	let ox: number;
+	let oy: number;
+	let oz: number;
+	if (Math.abs(x) <= Math.abs(y) && Math.abs(x) <= Math.abs(z)) {
+		ox = 0;
+		oy = -z;
+		oz = y;
+	} else if (Math.abs(y) <= Math.abs(x) && Math.abs(y) <= Math.abs(z)) {
+		ox = -z;
+		oy = 0;
+		oz = x;
+	} else {
+		ox = -y;
+		oy = x;
+		oz = 0;
+	}
+	let len = Math.hypot(ox, oy, oz);
+	if (len < 1e-8) {
+		ox = 1;
+		oy = 0;
+		oz = 0;
+		len = 1;
+	}
+	return [ox / len, oy / len, oz / len];
 }
 
 function clamp(value: number, min: number, max: number): number {

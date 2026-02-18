@@ -130,8 +130,8 @@ export function generateShadowKnot(options: ShadowKnotOptions): ShadowKnotResult
 	const cornerInset = clamp(options.cornerInset ?? 0.21, 0.04, 0.9);
 	const strokeWidth = clamp(options.strokeWidth ?? 3.6, 1.1, 20);
 	const useArcGuideLayout = options.useArcGuideLayout ?? false;
-	const width = 1180;
-	const height = 880;
+	const width = 960;
+	const height = 960;
 	const padding = 56;
 	const maxAttempts =
 		options.maxAttempts ?? Math.round(42 + Math.sqrt(normalized.target) * 5.2 + Math.max(0, strokeWidth - 6) * 5);

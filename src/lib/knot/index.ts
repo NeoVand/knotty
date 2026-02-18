@@ -7,4 +7,11 @@ export {
 } from './presets';
 export { estimateCrossings } from './metrics';
 export { KnotSolver, type SolverOptions, type SolverDiagnostics } from './solver';
-export { KnotEngine, type KnotEngineOptions, type KnotMetrics } from './engine';
+export {
+	KnotEngine,
+	type KnotEngineOptions,
+	type KnotLightingSettings,
+	type KnotMaterialPreset,
+	type KnotMaterialSettings,
+	type KnotMetrics
+} from './engine';

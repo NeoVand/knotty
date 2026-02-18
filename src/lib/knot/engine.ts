@@ -3,6 +3,7 @@ import * as THREE from 'three/webgpu';
 import { WebGLRenderer as CoreWebGLRenderer } from 'three';
 import WebGPU from 'three/examples/jsm/capabilities/WebGPU.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { estimateCrossings } from './metrics';
 import {
 	copyPoints,
@@ -17,6 +18,48 @@ const TUBE_COLOR = '#ffcf73';
 const LINE_COLOR = '#8cf7df';
 const COMPONENT_TUBE_COLORS = ['#ffcf73', '#79dfc4', '#f3a66a', '#73a5ff', '#d6e178', '#f288b4', '#b39dff'];
 const COMPONENT_LINE_COLORS = ['#8cf7df', '#61f2c6', '#ffc17d', '#8fc4ff', '#e2f28f', '#ff9ec8', '#c8b2ff'];
+
+export type KnotMaterialPreset = 'rope' | 'glass' | 'liquid_metal' | 'energy_field' | 'vector_field';
+
+export interface KnotMaterialSettings {
+	preset: KnotMaterialPreset;
+	roughness: number;
+	metalness: number;
+	transmission: number;
+	clearcoat: number;
+	envMapIntensity: number;
+	emissiveIntensity: number;
+	animationSpeed: number;
+	textureScale: number;
+}
+
+export interface KnotLightingSettings {
+	exposure: number;
+	ambientIntensity: number;
+	keyIntensity: number;
+	fillIntensity: number;
+	rimIntensity: number;
+}
+
+const DEFAULT_MATERIAL_SETTINGS: KnotMaterialSettings = {
+	preset: 'liquid_metal',
+	roughness: 0.18,
+	metalness: 1,
+	transmission: 0,
+	clearcoat: 0.88,
+	envMapIntensity: 1.6,
+	emissiveIntensity: 0.8,
+	animationSpeed: 1.25,
+	textureScale: 1.65
+};
+
+const DEFAULT_LIGHTING_SETTINGS: KnotLightingSettings = {
+	exposure: 0.62,
+	ambientIntensity: 0.12,
+	keyIntensity: 1.3,
+	fillIntensity: 0.06,
+	rimIntensity: 0.42
+};
 
 export interface KnotMetrics {
 	preset: KnotPresetName;
@@ -44,6 +87,19 @@ interface DragSelection {
 	pointIndex: number;
 }
 
+interface AnimatedTextureState {
+	texture: THREE.Texture;
+	speed: number;
+	axis: 'x' | 'y';
+}
+
+interface MaterialTextureLibrary {
+	brushedMetal: THREE.CanvasTexture;
+	energy: THREE.CanvasTexture;
+	vectorField: THREE.CanvasTexture;
+	frostedNormal: THREE.CanvasTexture;
+}
+
 export class KnotEngine {
 	private static readonly DEFAULT_WEBGPU_TEXTURE_LIMIT = 8192;
 	private static readonly MAX_TARGET_PIXEL_RATIO = 2;
@@ -55,6 +111,8 @@ export class KnotEngine {
 	private readonly pointer = new THREE.Vector2();
 	private readonly dragPlane = new THREE.Plane();
 	private readonly dragPoint = new THREE.Vector3();
+	private readonly dragPlaneHit = new THREE.Vector3();
+	private readonly dragOffset = new THREE.Vector3();
 	private readonly cameraDirection = new THREE.Vector3();
 	private readonly tempObject = new THREE.Object3D();
 
@@ -63,6 +121,13 @@ export class KnotEngine {
 	private camera: THREE.PerspectiveCamera | null = null;
 	private controls: OrbitControls | null = null;
 	private resizeObserver: ResizeObserver | null = null;
+	private environmentTarget: THREE.RenderTarget | null = null;
+	private ambientLight: THREE.HemisphereLight | null = null;
+	private keyLight: THREE.DirectionalLight | null = null;
+	private fillLight: THREE.DirectionalLight | null = null;
+	private rimLight: THREE.PointLight | null = null;
+	private groundPlane: THREE.Mesh<THREE.CircleGeometry, THREE.MeshPhysicalMaterial> | null = null;
+	private groundPatternTexture: THREE.CanvasTexture | null = null;
 
 	private state: KnotState | null = null;
 	private points: Float32Array | null = null;
@@ -77,11 +142,12 @@ export class KnotEngine {
 	private autoRelax = true;
 	private showSolidLink = true;
 	private showControlPoints = false;
-	private colorizeLinks = false;
+	private colorizeLinks = true;
 	private useArcGuideLayout = true;
 	private repulsionStrength = 1;
 	private relaxSmoothness = 0.62;
 	private relaxIterations = 3;
+	private lengthTargetScale = 0.88;
 	private dragIndex: number | null = null;
 	private dragComponentIndex: number | null = null;
 	private readonly dragTarget = new THREE.Vector3();
@@ -91,8 +157,14 @@ export class KnotEngine {
 	private lastFrameAt = 0;
 	private lastMetricAt = 0;
 	private lastBoundsAt = 0;
+	private releaseStabilizeUntil = 0;
+	private controlsInteracting = false;
 	private relaxTick = 0;
 	private maxRenderDimension2D = KnotEngine.DEFAULT_WEBGPU_TEXTURE_LIMIT;
+	private materialSettings: KnotMaterialSettings = { ...DEFAULT_MATERIAL_SETTINGS };
+	private lightingSettings: KnotLightingSettings = { ...DEFAULT_LIGHTING_SETTINGS };
+	private materialTextures: MaterialTextureLibrary | null = null;
+	private animatedTextures: AnimatedTextureState[] = [];
 
 	constructor(options: KnotEngineOptions) {
 		this.container = options.container;
@@ -104,32 +176,52 @@ export class KnotEngine {
 		if (this.disposed) return;
 
 		this.scene = new THREE.Scene();
-		this.scene.background = new THREE.Color('#051d1a');
-		this.scene.fog = new THREE.Fog('#051d1a', 7, 18);
+		this.scene.background = new THREE.Color('#041410');
+		this.scene.fog = null;
 
 		this.camera = new THREE.PerspectiveCamera(43, 1, 0.1, 120);
 		this.camera.position.set(0, 0, 7.8);
 
 		this.renderer = await this.createRenderer();
 		this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-		this.renderer.toneMappingExposure = 1.1;
+		this.renderer.toneMappingExposure = this.lightingSettings.exposure;
+		const rendererShadowMap = this.renderer as unknown as {
+			shadowMap?: { enabled: boolean; type?: THREE.ShadowMapType };
+		};
+		if (rendererShadowMap.shadowMap) {
+			rendererShadowMap.shadowMap.enabled = true;
+			rendererShadowMap.shadowMap.type = THREE.PCFSoftShadowMap;
+		}
 		this.renderer.domElement.style.display = 'block';
 		this.renderer.domElement.style.width = '100%';
 		this.renderer.domElement.style.height = '100%';
 		this.container.appendChild(this.renderer.domElement);
+		this.buildEnvironmentMap();
 
 		this.controls = new OrbitControls(this.camera, this.renderer.domElement);
 		this.controls.enableDamping = true;
 		this.controls.dampingFactor = 0.09;
 		this.controls.minDistance = 4.2;
 		this.controls.maxDistance = 42;
+		this.controls.addEventListener('start', this.handleControlsStart);
+		this.controls.addEventListener('end', this.handleControlsEnd);
 
-		const hemi = new THREE.HemisphereLight('#7effdd', '#071511', 0.85);
-		const key = new THREE.DirectionalLight('#fff6cf', 1.35);
-		key.position.set(5, 7, 6);
-		const rim = new THREE.PointLight('#ff9f4a', 15, 20, 2);
-		rim.position.set(-3.6, 1.4, -4.2);
-		this.scene.add(hemi, key, rim);
+		this.ambientLight = new THREE.HemisphereLight('#7effdd', '#071511', this.lightingSettings.ambientIntensity);
+		this.keyLight = new THREE.DirectionalLight('#fff6cf', this.lightingSettings.keyIntensity);
+		this.keyLight.position.set(5, 7, 6);
+		this.keyLight.castShadow = true;
+		this.keyLight.shadow.mapSize.set(4096, 4096);
+		this.keyLight.shadow.bias = -0.00003;
+		this.keyLight.shadow.normalBias = 0.01;
+		this.keyLight.shadow.radius = 2;
+		this.scene.add(this.keyLight.target);
+		this.fillLight = new THREE.DirectionalLight('#7fbfff', this.lightingSettings.fillIntensity);
+		this.fillLight.position.set(-5.5, -1.4, 4.8);
+		this.rimLight = new THREE.PointLight('#ff9f4a', this.lightingSettings.rimIntensity * 15, 20, 2);
+		this.rimLight.position.set(-3.6, 1.4, -4.2);
+		this.scene.add(this.ambientLight, this.keyLight, this.fillLight, this.rimLight);
+		this.createGroundPlane();
+		this.applyLightingSettings();
 
 		this.attachInteractionHandlers();
 		this.setShowControlPoints(false);
@@ -149,11 +241,27 @@ export class KnotEngine {
 		if (this.disposed) return;
 		this.disposed = true;
 		this.running = false;
+		this.animatedTextures = [];
 		this.detachInteractionHandlers();
 		this.resizeObserver?.disconnect();
-		this.controls?.dispose();
-		this.controls = null;
+		if (this.controls) {
+			this.controls.removeEventListener('start', this.handleControlsStart);
+			this.controls.removeEventListener('end', this.handleControlsEnd);
+			this.controls.dispose();
+			this.controls = null;
+		}
 		this.disposeGeometry();
+		this.disposeGroundPlane();
+		this.disposeTextureLibrary();
+		if (this.environmentTarget) {
+			this.environmentTarget.dispose();
+			this.environmentTarget = null;
+		}
+		if (this.scene) this.scene.environment = null;
+		this.ambientLight = null;
+		this.keyLight = null;
+		this.fillLight = null;
+		this.rimLight = null;
 		this.renderer?.dispose();
 		if (this.renderer?.domElement.parentElement === this.container) {
 			this.container.removeChild(this.renderer.domElement);
@@ -204,6 +312,36 @@ export class KnotEngine {
 		this.applyComponentColors();
 	}
 
+	setMaterialSettings(next: Partial<KnotMaterialSettings>): void {
+		this.materialSettings = {
+			preset: next.preset ?? this.materialSettings.preset,
+			roughness: clampNumber(next.roughness ?? this.materialSettings.roughness, 0.02, 1),
+			metalness: clampNumber(next.metalness ?? this.materialSettings.metalness, 0, 1),
+			transmission: clampNumber(next.transmission ?? this.materialSettings.transmission, 0, 1),
+			clearcoat: clampNumber(next.clearcoat ?? this.materialSettings.clearcoat, 0, 1),
+			envMapIntensity: clampNumber(next.envMapIntensity ?? this.materialSettings.envMapIntensity, 0, 3),
+			emissiveIntensity: clampNumber(next.emissiveIntensity ?? this.materialSettings.emissiveIntensity, 0, 4),
+			animationSpeed: clampNumber(next.animationSpeed ?? this.materialSettings.animationSpeed, 0, 6),
+			textureScale: clampNumber(next.textureScale ?? this.materialSettings.textureScale, 0.2, 8)
+		};
+		this.restyleTubeMaterials();
+	}
+
+	setLightingSettings(next: Partial<KnotLightingSettings>): void {
+		this.lightingSettings = {
+			exposure: clampNumber(next.exposure ?? this.lightingSettings.exposure, 0.3, 2.7),
+			ambientIntensity: clampNumber(
+				next.ambientIntensity ?? this.lightingSettings.ambientIntensity,
+				0,
+				2.4
+			),
+			keyIntensity: clampNumber(next.keyIntensity ?? this.lightingSettings.keyIntensity, 0, 4),
+			fillIntensity: clampNumber(next.fillIntensity ?? this.lightingSettings.fillIntensity, 0, 3),
+			rimIntensity: clampNumber(next.rimIntensity ?? this.lightingSettings.rimIntensity, 0, 3)
+		};
+		this.applyLightingSettings();
+	}
+
 	setArcGuideLayout(value: boolean): void {
 		this.useArcGuideLayout = value;
 	}
@@ -220,6 +358,12 @@ export class KnotEngine {
 
 	setRelaxIterations(value: number): void {
 		this.relaxIterations = clampInteger(value, 1, 8);
+	}
+
+	setLengthTargetScale(value: number): void {
+		this.lengthTargetScale = clampNumber(value, 0.6, 1.1);
+		this.applyLengthTargetScale();
+		this.applySolverTuning();
 	}
 
 	stepRelax(iterations = 12): void {
@@ -254,8 +398,9 @@ export class KnotEngine {
 
 		const dt = Math.min(1 / 25, Math.max(1 / 200, (now - this.lastFrameAt) / 1000));
 		this.lastFrameAt = now;
+		const allowRecentering = now >= this.releaseStabilizeUntil;
 
-		if (this.autoRelax && this.dragIndex === null) {
+		if (this.autoRelax && this.dragIndex === null && !this.controlsInteracting) {
 			this.stepAllComponents(this.relaxIterations, dt, null);
 			this.geometryDirty = true;
 		}
@@ -271,10 +416,16 @@ export class KnotEngine {
 		}
 
 		if (this.geometryDirty) this.rebuildGeometry();
-		if (now - this.lastBoundsAt > 220) {
+		if (
+			this.dragIndex === null &&
+			!this.controlsInteracting &&
+			allowRecentering &&
+			now - this.lastBoundsAt > 220
+		) {
 			this.lastBoundsAt = now;
 			this.updateCameraForCurrentBounds();
 		}
+		this.updateAnimatedMaterialTextures(dt);
 		controls.update();
 		renderer.render(scene, camera);
 
@@ -296,10 +447,9 @@ export class KnotEngine {
 		this.passiveComponents = this.state.componentsPoints.slice(1).map((component) => copyPoints(component));
 		this.passiveSolvers = [];
 		this.relaxTick = 0;
-		const multipleComponents = this.state.componentCount > 1;
 		const activeRestLength = this.state.componentRestLengths[0] ?? this.state.restLength;
 		this.solver = new KnotSolver(this.points.length / 3, activeRestLength, this.currentSolverOptions());
-		this.solver.setKeepCentered(!multipleComponents);
+		this.solver.setKeepCentered(false);
 		for (let componentIndex = 0; componentIndex < this.passiveComponents.length; componentIndex += 1) {
 			const componentPoints = this.passiveComponents[componentIndex];
 			const componentRestLength =
@@ -313,8 +463,11 @@ export class KnotEngine {
 			this.passiveSolvers.push(componentSolver);
 		}
 		this.applySolverTuning();
+		this.applyLengthTargetScale();
 		this.dragIndex = null;
 		this.dragComponentIndex = null;
+		this.controlsInteracting = false;
+		this.releaseStabilizeUntil = 0;
 		this.geometryDirty = true;
 		this.rebuildGeometry(true);
 		this.fitViewToState();
@@ -325,7 +478,8 @@ export class KnotEngine {
 		const tension = this.relaxSmoothness;
 		const surfaceBarrierWeight = 0.6 + this.repulsionStrength * 1.5;
 		const surfacePenetrationWeight = 160 + this.repulsionStrength * 240;
-		const stretchWeight = 220 + tension * 430;
+		const lengthTensionBoost = Math.max(0, 1 - this.lengthTargetScale) * 1200;
+		const stretchWeight = 220 + tension * 430 + lengthTensionBoost;
 		const bendingWeight = 10 + tension * 78;
 		const constraintPasses = 10 + Math.round(this.repulsionStrength * 2 + tension * 6);
 		const edgeCollisionPasses = 2 + Math.round(this.repulsionStrength * 0.7);
@@ -349,7 +503,8 @@ export class KnotEngine {
 		const tension = this.relaxSmoothness;
 		const surfaceBarrierWeight = 0.6 + this.repulsionStrength * 1.5;
 		const surfacePenetrationWeight = 160 + this.repulsionStrength * 240;
-		const stretchWeight = 220 + tension * 430;
+		const lengthTensionBoost = Math.max(0, 1 - this.lengthTargetScale) * 1200;
+		const stretchWeight = 220 + tension * 430 + lengthTensionBoost;
 		const bendingWeight = 10 + tension * 78;
 		const constraintPasses = 10 + Math.round(this.repulsionStrength * 2 + tension * 6);
 		const edgeCollisionPasses = 2 + Math.round(this.repulsionStrength * 0.7);
@@ -383,7 +538,18 @@ export class KnotEngine {
 		}
 	}
 
-	private stepAllComponents(iterations: number, dt: number, dragSelection: DragSelection | null): void {
+	private applyLengthTargetScale(): void {
+		if (this.solver) this.solver.setRestLengthScale(this.lengthTargetScale);
+		for (const solver of this.passiveSolvers) {
+			solver.setRestLengthScale(this.lengthTargetScale);
+		}
+	}
+
+	private stepAllComponents(
+		iterations: number,
+		dt: number,
+		dragSelection: DragSelection | null
+	): void {
 		if (!this.state) return;
 		const steps = Math.max(1, iterations);
 		for (let iteration = 0; iteration < steps; iteration += 1) {
@@ -399,11 +565,14 @@ export class KnotEngine {
 					dragSelection && dragSelection.componentIndex === componentIndex ? dragSelection.pointIndex : null;
 				solver.enforceInextensibility(points, pinnedIndex, this.state!.thickness, 1);
 			});
+			this.forEachDynamicComponent((componentIndex, points) => {
+				const pinnedIndex =
+					dragSelection && dragSelection.componentIndex === componentIndex ? dragSelection.pointIndex : null;
+				const targetLength = this.getComponentConstraintLength(componentIndex);
+				projectComponentEdgeLengths(points, targetLength, dragSelection ? 1 : 2, pinnedIndex);
+			});
 			if (dragSelection === null && this.relaxTick % 3 === 0) {
 				this.reparameterizeAllComponents(null);
-			}
-			if (dragSelection === null && this.state.componentCount > 1) {
-				this.recenterAllComponents();
 			}
 		}
 	}
@@ -428,16 +597,10 @@ export class KnotEngine {
 
 		const tubeGeometry = createTubeGeometry(points, state.thickness);
 		if (!this.tubeMesh) {
-			const tubeMaterial = new THREE.MeshPhysicalMaterial({
-				color: TUBE_COLOR,
-				roughness: 0.23,
-				metalness: 0.06,
-				clearcoat: 0.7,
-				clearcoatRoughness: 0.24
-			});
+			const tubeMaterial = this.createTubeMaterial(0);
 			this.tubeMesh = new THREE.Mesh(tubeGeometry, tubeMaterial);
-			this.tubeMesh.castShadow = false;
-			this.tubeMesh.receiveShadow = false;
+			this.tubeMesh.castShadow = true;
+			this.tubeMesh.receiveShadow = true;
 			scene.add(this.tubeMesh);
 		} else {
 			this.tubeMesh.geometry.dispose();
@@ -487,6 +650,7 @@ export class KnotEngine {
 		}
 
 		this.applyComponentColors();
+		this.rebuildAnimatedTextureList();
 		this.updateControlPoints();
 		this.geometryDirty = false;
 	}
@@ -516,16 +680,10 @@ export class KnotEngine {
 			this.clearPassiveGeometry();
 			for (let i = 0; i < this.passiveComponents.length; i += 1) {
 				const points = this.passiveComponents[i];
-				const tubeMaterial = new THREE.MeshPhysicalMaterial({
-					color: TUBE_COLOR,
-					roughness: 0.23,
-					metalness: 0.06,
-					clearcoat: 0.7,
-					clearcoatRoughness: 0.24
-				});
+				const tubeMaterial = this.createTubeMaterial(i + 1);
 				const tubeMesh = new THREE.Mesh(createTubeGeometry(points, state.thickness), tubeMaterial);
-				tubeMesh.castShadow = false;
-				tubeMesh.receiveShadow = false;
+				tubeMesh.castShadow = true;
+				tubeMesh.receiveShadow = true;
 				tubeMesh.visible = this.showSolidLink;
 				scene.add(tubeMesh);
 				this.passiveTubeMeshes.push(tubeMesh);
@@ -540,6 +698,7 @@ export class KnotEngine {
 				scene.add(lineMesh);
 				this.passiveLineMeshes.push(lineMesh);
 			}
+			this.rebuildAnimatedTextureList();
 			return;
 		}
 
@@ -554,13 +713,14 @@ export class KnotEngine {
 			lineMesh.geometry = createLineGeometry(points);
 			lineMesh.visible = !this.showSolidLink;
 		}
+		this.rebuildAnimatedTextureList();
 	}
 
 	private clearPassiveGeometry(): void {
 		for (const mesh of this.passiveTubeMeshes) {
 			this.scene?.remove(mesh);
 			mesh.geometry.dispose();
-			(mesh.material as THREE.Material).dispose();
+			this.disposeTubeMaterial(mesh.material as THREE.MeshPhysicalMaterial);
 		}
 		for (const mesh of this.passiveLineMeshes) {
 			this.scene?.remove(mesh);
@@ -569,25 +729,382 @@ export class KnotEngine {
 		}
 		this.passiveTubeMeshes = [];
 		this.passiveLineMeshes = [];
+		this.rebuildAnimatedTextureList();
 	}
 
 	private applyComponentColors(): void {
 		if (this.tubeMesh) {
 			const material = this.tubeMesh.material as THREE.MeshPhysicalMaterial;
-			material.color.set(componentTubeColor(this.colorizeLinks, 0));
+			material.color.set(this.resolveTubeColor(0));
 		}
 		if (this.lineMesh) {
 			const material = this.lineMesh.material as THREE.LineBasicMaterial;
-			material.color.set(componentLineColor(this.colorizeLinks, 0));
+			material.color.set(this.resolveLineColor(0));
 		}
 		for (let i = 0; i < this.passiveTubeMeshes.length; i += 1) {
 			const material = this.passiveTubeMeshes[i].material as THREE.MeshPhysicalMaterial;
-			material.color.set(componentTubeColor(this.colorizeLinks, i + 1));
+			material.color.set(this.resolveTubeColor(i + 1));
 		}
 		for (let i = 0; i < this.passiveLineMeshes.length; i += 1) {
 			const material = this.passiveLineMeshes[i].material as THREE.LineBasicMaterial;
-			material.color.set(componentLineColor(this.colorizeLinks, i + 1));
+			material.color.set(this.resolveLineColor(i + 1));
 		}
+	}
+
+	private resolveTubeColor(componentIndex: number): string {
+		if (this.colorizeLinks) return componentTubeColor(true, componentIndex);
+		return presetTubeColor(this.materialSettings.preset);
+	}
+
+	private resolveLineColor(componentIndex: number): string {
+		if (this.colorizeLinks) return componentLineColor(true, componentIndex);
+		return presetLineColor(this.materialSettings.preset);
+	}
+
+	private restyleTubeMaterials(): void {
+		if (this.tubeMesh) {
+			this.configureTubeMaterial(this.tubeMesh.material as THREE.MeshPhysicalMaterial, 0);
+		}
+		for (let i = 0; i < this.passiveTubeMeshes.length; i += 1) {
+			const material = this.passiveTubeMeshes[i].material as THREE.MeshPhysicalMaterial;
+			this.configureTubeMaterial(material, i + 1);
+		}
+		this.rebuildAnimatedTextureList();
+		this.applyComponentColors();
+	}
+
+	private createTubeMaterial(componentIndex: number): THREE.MeshPhysicalMaterial {
+		const material = new THREE.MeshPhysicalMaterial();
+		this.configureTubeMaterial(material, componentIndex);
+		return material;
+	}
+
+	private configureTubeMaterial(material: THREE.MeshPhysicalMaterial, componentIndex: number): void {
+		this.releaseOwnedMaterialTextures(material);
+		const settings = this.materialSettings;
+		const textures = this.getMaterialTextureLibrary();
+		const textureScale = settings.textureScale;
+		const flowSpeed = settings.animationSpeed;
+		const ownedTextures: THREE.Texture[] = [];
+		const animated: AnimatedTextureState[] = [];
+
+		material.map = null;
+		material.normalMap = null;
+		material.normalScale.set(1, 1);
+		material.emissiveMap = null;
+		material.emissive.set('#000000');
+		material.attenuationColor.set('#ffffff');
+		material.attenuationDistance = Infinity;
+		material.reflectivity = 0.5;
+		material.specularIntensity = 1;
+		material.side = THREE.FrontSide;
+		material.depthWrite = true;
+		material.depthTest = true;
+		material.roughness = settings.roughness;
+		material.metalness = settings.metalness;
+		material.transmission = settings.transmission;
+		material.thickness = 0.55;
+		material.ior = 1.42;
+		material.clearcoat = settings.clearcoat;
+		material.clearcoatRoughness = clampNumber(settings.roughness * 0.92, 0.02, 1);
+		material.envMapIntensity = settings.envMapIntensity;
+		material.emissiveIntensity = settings.emissiveIntensity * 0.08;
+		material.color.set(this.resolveTubeColor(componentIndex));
+		material.opacity = 1;
+		material.transparent = false;
+
+		switch (settings.preset) {
+			case 'rope': {
+				material.roughness = clampNumber(settings.roughness * 1.12, 0.03, 1);
+				material.metalness = clampNumber(settings.metalness * 0.2, 0, 0.35);
+				material.clearcoat = clampNumber(settings.clearcoat * 0.55, 0, 0.8);
+				material.envMapIntensity = settings.envMapIntensity * 0.7;
+				break;
+			}
+			case 'glass': {
+				material.roughness = clampNumber(settings.roughness * 0.22, 0.01, 0.2);
+				material.metalness = 0;
+				material.transmission = Math.max(settings.transmission, 0.94);
+				material.thickness = 0.42;
+				material.ior = 1.5;
+				material.clearcoat = Math.max(settings.clearcoat, 0.96);
+				material.clearcoatRoughness = clampNumber(material.roughness * 0.3, 0.01, 0.12);
+				material.envMapIntensity = Math.max(settings.envMapIntensity, 1.12);
+				material.attenuationDistance = 2.3;
+				material.attenuationColor.set(this.resolveTubeColor(componentIndex));
+				material.reflectivity = 0.92;
+				material.transparent = true;
+				material.opacity = 0.3;
+				material.side = THREE.DoubleSide;
+				material.depthWrite = false;
+				const frosted = this.cloneTextureForMaterial(
+					textures.frostedNormal,
+					textureScale * 1.6,
+					textureScale * 1.6,
+					componentIndex * 0.12
+				);
+				material.normalMap = frosted;
+				material.normalScale.set(0.04, 0.04);
+				ownedTextures.push(frosted);
+				break;
+			}
+			case 'liquid_metal': {
+				material.roughness = clampNumber(settings.roughness * 0.55, 0.12, 0.32);
+				material.metalness = Math.max(settings.metalness, 0.95);
+				material.clearcoat = Math.max(settings.clearcoat, 0.8);
+				material.clearcoatRoughness = clampNumber(settings.roughness * 0.28, 0.08, 0.22);
+				material.envMapIntensity = clampNumber(Math.max(settings.envMapIntensity, 1.05), 0.3, 1.4);
+				material.map = null;
+				break;
+			}
+			case 'energy_field': {
+				material.roughness = clampNumber(settings.roughness * 0.54, 0.02, 0.6);
+				material.metalness = clampNumber(settings.metalness * 0.4, 0, 0.55);
+				material.transmission = Math.max(settings.transmission * 0.5, 0.28);
+				material.clearcoat = Math.max(settings.clearcoat, 0.68);
+				material.envMapIntensity = settings.envMapIntensity * 0.86;
+				material.emissive.set(this.colorizeLinks ? componentLineColor(true, componentIndex) : '#4fc7ff');
+				material.emissiveIntensity = settings.emissiveIntensity * 1.85;
+				material.transparent = true;
+				material.depthWrite = false;
+				const energy = this.cloneTextureForMaterial(
+					textures.energy,
+					textureScale * 2.8,
+					textureScale * 1.15,
+					componentIndex * 0.17
+				);
+				material.emissiveMap = energy;
+				ownedTextures.push(energy);
+				animated.push({
+					texture: energy,
+					speed: 0.08 + flowSpeed * 0.28 + componentIndex * 0.04,
+					axis: 'x'
+				});
+				break;
+			}
+			case 'vector_field': {
+				material.roughness = clampNumber(settings.roughness * 0.64, 0.03, 0.72);
+				material.metalness = clampNumber(settings.metalness * 0.42, 0, 0.62);
+				material.clearcoat = Math.max(settings.clearcoat, 0.64);
+				material.envMapIntensity = settings.envMapIntensity * 0.82;
+				material.emissive.set(this.colorizeLinks ? componentLineColor(true, componentIndex) : '#68ffe0');
+				material.emissiveIntensity = settings.emissiveIntensity * 1.34;
+				material.transparent = material.transmission > 0.02;
+				if (material.transparent) material.depthWrite = false;
+				const vectors = this.cloneTextureForMaterial(
+					textures.vectorField,
+					textureScale * 2.5,
+					textureScale * 1.4,
+					componentIndex * 0.21,
+					componentIndex * 0.03
+				);
+				material.emissiveMap = vectors;
+				ownedTextures.push(vectors);
+				animated.push({
+					texture: vectors,
+					speed: 0.05 + flowSpeed * 0.22 + componentIndex * 0.03,
+					axis: 'y'
+				});
+				break;
+			}
+		}
+
+		material.userData.knottyOwnedTextures = ownedTextures;
+		material.userData.knottyAnimatedTextures = animated;
+		material.needsUpdate = true;
+	}
+
+	private cloneTextureForMaterial(
+		base: THREE.Texture,
+		repeatX: number,
+		repeatY: number,
+		offsetX = 0,
+		offsetY = 0
+	): THREE.Texture {
+		const texture = base.clone();
+		texture.wrapS = THREE.MirroredRepeatWrapping;
+		texture.wrapT = THREE.MirroredRepeatWrapping;
+		texture.repeat.set(Math.max(0.02, repeatX), Math.max(0.02, repeatY));
+		texture.offset.set(modulo1(offsetX), modulo1(offsetY));
+		texture.needsUpdate = true;
+		return texture;
+	}
+
+	private releaseOwnedMaterialTextures(material: THREE.MeshPhysicalMaterial): void {
+		const owned = material.userData.knottyOwnedTextures as THREE.Texture[] | undefined;
+		if (owned) {
+			for (const texture of owned) texture.dispose();
+		}
+		material.userData.knottyOwnedTextures = [];
+		material.userData.knottyAnimatedTextures = [];
+	}
+
+	private disposeTubeMaterial(material: THREE.MeshPhysicalMaterial): void {
+		this.releaseOwnedMaterialTextures(material);
+		material.dispose();
+	}
+
+	private rebuildAnimatedTextureList(): void {
+		const animated: AnimatedTextureState[] = [];
+		const appendFrom = (mesh: THREE.Mesh | null): void => {
+			if (!mesh) return;
+			const material = mesh.material as THREE.MeshPhysicalMaterial;
+			const entries = material.userData.knottyAnimatedTextures as AnimatedTextureState[] | undefined;
+			if (!entries || entries.length === 0) return;
+			for (const entry of entries) animated.push(entry);
+		};
+		appendFrom(this.tubeMesh);
+		for (const mesh of this.passiveTubeMeshes) appendFrom(mesh);
+		this.animatedTextures = animated;
+	}
+
+	private updateAnimatedMaterialTextures(dt: number): void {
+		if (this.animatedTextures.length === 0) return;
+		for (const entry of this.animatedTextures) {
+			const speed = entry.speed * dt;
+			if (entry.axis === 'x') {
+				entry.texture.offset.x += speed;
+				if (entry.texture.offset.x > 1024) entry.texture.offset.x -= 1024;
+			} else {
+				entry.texture.offset.y += speed;
+				if (entry.texture.offset.y > 1024) entry.texture.offset.y -= 1024;
+			}
+		}
+	}
+
+	private applyLightingSettings(): void {
+		if (this.renderer) this.renderer.toneMappingExposure = this.lightingSettings.exposure;
+		if (this.ambientLight) this.ambientLight.intensity = this.lightingSettings.ambientIntensity;
+		if (this.keyLight) this.keyLight.intensity = this.lightingSettings.keyIntensity;
+		if (this.fillLight) this.fillLight.intensity = this.lightingSettings.fillIntensity;
+		if (this.rimLight) this.rimLight.intensity = this.lightingSettings.rimIntensity * 10;
+	}
+
+	private createGroundPlane(): void {
+		if (!this.scene || this.groundPlane) return;
+		const geometry = new THREE.CircleGeometry(1, 160);
+		const patternTexture = createPoincareDiskTexture(4096);
+		patternTexture.wrapS = THREE.ClampToEdgeWrapping;
+		patternTexture.wrapT = THREE.ClampToEdgeWrapping;
+		patternTexture.repeat.set(1, 1);
+		const maxAnisotropy =
+			(this.renderer as unknown as { capabilities?: { getMaxAnisotropy?: () => number } } | null)?.capabilities?.getMaxAnisotropy?.() ??
+			16;
+		patternTexture.anisotropy = Math.max(8, Math.min(24, maxAnisotropy));
+		patternTexture.minFilter = THREE.LinearMipmapLinearFilter;
+		patternTexture.magFilter = THREE.LinearFilter;
+		patternTexture.generateMipmaps = true;
+		patternTexture.needsUpdate = true;
+		this.groundPatternTexture = patternTexture;
+		const material = new THREE.MeshPhysicalMaterial({
+			color: '#ffffff',
+			map: patternTexture,
+			roughness: 0.44,
+			metalness: 0.15,
+			clearcoat: 0.92,
+			clearcoatRoughness: 0.18,
+			envMapIntensity: 1.1,
+			emissive: new THREE.Color('#000000'),
+			emissiveIntensity: 0
+		});
+		this.groundPlane = new THREE.Mesh(geometry, material);
+		this.groundPlane.rotation.x = -Math.PI / 2;
+		this.groundPlane.receiveShadow = true;
+		this.groundPlane.castShadow = false;
+		this.groundPlane.frustumCulled = false;
+		this.scene.add(this.groundPlane);
+	}
+
+	private disposeGroundPlane(): void {
+		if (!this.groundPlane) return;
+		this.scene?.remove(this.groundPlane);
+		this.groundPlane.geometry.dispose();
+		this.groundPatternTexture?.dispose();
+		this.groundPatternTexture = null;
+		this.groundPlane.material.dispose();
+		this.groundPlane = null;
+	}
+
+	private updateGroundPlane(center: THREE.Vector3, radius: number): void {
+		if (!this.groundPlane) return;
+		const safeRadius = Math.max(0.2, radius);
+		const size = Math.max(14, safeRadius * 11);
+		const drop = Math.max(1.4, safeRadius * 1.2);
+		this.groundPlane.scale.set(size, size, 1);
+		this.groundPlane.position.set(center.x, center.y - drop, center.z);
+		if (this.keyLight) {
+			this.keyLight.target.position.set(center.x, center.y - safeRadius * 0.22, center.z);
+			this.keyLight.target.updateMatrixWorld();
+			const shadowCamera = this.keyLight.shadow.camera as THREE.OrthographicCamera;
+			const span = Math.max(6, safeRadius * 8.5);
+			shadowCamera.left = -span;
+			shadowCamera.right = span;
+			shadowCamera.top = span;
+			shadowCamera.bottom = -span;
+			shadowCamera.near = 0.1;
+			shadowCamera.far = Math.max(28, safeRadius * 36);
+			shadowCamera.updateProjectionMatrix();
+		}
+	}
+
+	private buildEnvironmentMap(): void {
+		if (!this.renderer || !this.scene) return;
+		if (this.environmentTarget) {
+			this.environmentTarget.dispose();
+			this.environmentTarget = null;
+		}
+		if (this.renderer instanceof CoreWebGLRenderer) {
+			this.scene.environment = null;
+			return;
+		}
+		const renderer = this.renderer as unknown as never;
+		const pmremGenerator = new THREE.PMREMGenerator(renderer);
+		const environmentScene = new THREE.Scene();
+		const roomEnvironment = new RoomEnvironment();
+		environmentScene.add(roomEnvironment);
+		const reflectionPattern = createPoincareDiskTexture(1536);
+		reflectionPattern.wrapS = THREE.ClampToEdgeWrapping;
+		reflectionPattern.wrapT = THREE.ClampToEdgeWrapping;
+		reflectionPattern.repeat.set(1, 1);
+		const reflectionFloor = new THREE.Mesh(
+			new THREE.CircleGeometry(8, 128),
+			new THREE.MeshStandardMaterial({
+				color: '#ffffff',
+				map: reflectionPattern,
+				roughness: 0.42,
+				metalness: 0.08
+			})
+		);
+		reflectionFloor.rotation.x = -Math.PI / 2;
+		reflectionFloor.position.y = -1.9;
+		environmentScene.add(reflectionFloor);
+		this.environmentTarget = pmremGenerator.fromScene(environmentScene, 0.32);
+		this.scene.environment = this.environmentTarget.texture;
+		pmremGenerator.dispose();
+		reflectionFloor.geometry.dispose();
+		(reflectionFloor.material as THREE.MeshStandardMaterial).dispose();
+		reflectionPattern.dispose();
+		(roomEnvironment as unknown as { dispose?: () => void }).dispose?.();
+	}
+
+	private getMaterialTextureLibrary(): MaterialTextureLibrary {
+		if (this.materialTextures) return this.materialTextures;
+		this.materialTextures = {
+			brushedMetal: createBrushedMetalTexture(),
+			energy: createEnergyTexture(),
+			vectorField: createVectorFieldTexture(),
+			frostedNormal: createFrostedNormalTexture()
+		};
+		return this.materialTextures;
+	}
+
+	private disposeTextureLibrary(): void {
+		if (!this.materialTextures) return;
+		this.materialTextures.brushedMetal.dispose();
+		this.materialTextures.energy.dispose();
+		this.materialTextures.vectorField.dispose();
+		this.materialTextures.frostedNormal.dispose();
+		this.materialTextures = null;
 	}
 
 	private getComponentPoints(componentIndex: number): Float32Array | null {
@@ -606,6 +1123,15 @@ export class KnotEngine {
 		const points = this.passiveComponents[componentIndex - 1];
 		const fallback = points ? averageEdgeLength(points) : 0;
 		return this.state.componentRestLengths[componentIndex] ?? fallback;
+	}
+
+	private getComponentConstraintLength(componentIndex: number): number {
+		const solver = this.getComponentSolver(componentIndex);
+		if (solver) {
+			const current = solver.getCurrentRestLength();
+			if (Number.isFinite(current) && current > 0) return current;
+		}
+		return this.getComponentRestLength(componentIndex);
 	}
 
 	private resolveComponentIndexFromTubeObject(object: THREE.Object3D): number | null {
@@ -734,6 +1260,15 @@ export class KnotEngine {
 		window.removeEventListener('pointercancel', this.handlePointerUp);
 	}
 
+	private handleControlsStart = (): void => {
+		this.controlsInteracting = true;
+	};
+
+	private handleControlsEnd = (): void => {
+		this.controlsInteracting = false;
+		this.lastBoundsAt = performance.now();
+	};
+
 	private handlePointerDown = (event: PointerEvent): void => {
 		if (!this.camera || !this.renderer || !this.points || !this.controls) return;
 		const dom = this.renderer.domElement;
@@ -782,6 +1317,12 @@ export class KnotEngine {
 		this.dragTarget.copy(this.dragPoint);
 		this.camera.getWorldDirection(this.cameraDirection);
 		this.dragPlane.setFromNormalAndCoplanarPoint(this.cameraDirection, this.dragPoint);
+		if (this.raycaster.ray.intersectPlane(this.dragPlane, this.dragPlaneHit)) {
+			this.dragOffset.copy(this.dragTarget).sub(this.dragPlaneHit);
+		} else {
+			this.dragOffset.set(0, 0, 0);
+		}
+		this.controlsInteracting = false;
 		this.controls.enabled = false;
 		dom.setPointerCapture(event.pointerId);
 		this.notifyStatus(
@@ -804,14 +1345,19 @@ export class KnotEngine {
 		const y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 		this.pointer.set(x, y);
 		this.raycaster.setFromCamera(this.pointer, this.camera);
-		if (!this.raycaster.ray.intersectPlane(this.dragPlane, this.dragPoint)) return;
-		this.dragTarget.copy(this.dragPoint);
+		if (!this.raycaster.ray.intersectPlane(this.dragPlane, this.dragPlaneHit)) return;
+		this.dragTarget.copy(this.dragPlaneHit).add(this.dragOffset);
 	};
 
 	private handlePointerUp = (): void => {
 		if (this.dragIndex === null || this.dragComponentIndex === null || !this.controls) return;
 		this.dragIndex = null;
 		this.dragComponentIndex = null;
+		this.dragOffset.set(0, 0, 0);
+		const now = performance.now();
+		this.releaseStabilizeUntil = now + 320;
+		this.lastBoundsAt = now;
+		this.controlsInteracting = false;
 		this.controls.enabled = true;
 		this.notifyStatus('Released segment. Keep relaxing or continue dragging.');
 	};
@@ -820,7 +1366,7 @@ export class KnotEngine {
 		if (this.tubeMesh) {
 			this.scene?.remove(this.tubeMesh);
 			this.tubeMesh.geometry.dispose();
-			(this.tubeMesh.material as THREE.Material).dispose();
+			this.disposeTubeMaterial(this.tubeMesh.material as THREE.MeshPhysicalMaterial);
 			this.tubeMesh = null;
 		}
 		if (this.lineMesh) {
@@ -837,19 +1383,20 @@ export class KnotEngine {
 			(this.controlMesh.material as THREE.Material).dispose();
 			this.controlMesh = null;
 		}
+		this.animatedTextures = [];
 	}
 
 	private applyDragTarget(): void {
 		if (this.dragIndex === null || this.dragComponentIndex === null || !this.state) return;
 		const points = this.getComponentPoints(this.dragComponentIndex);
 		const solver = this.getComponentSolver(this.dragComponentIndex);
-		const restLength = this.getComponentRestLength(this.dragComponentIndex);
+		const restLength = this.getComponentConstraintLength(this.dragComponentIndex);
 		if (!points || !solver || !Number.isFinite(restLength) || restLength <= 0) return;
 		const count = points.length / 3;
 		const idx = this.dragIndex * 3;
 		const current = new THREE.Vector3(points[idx], points[idx + 1], points[idx + 2]);
 		const delta = this.dragTarget.clone().sub(current);
-		const maxMove = restLength * 0.52;
+		const maxMove = restLength * 0.2;
 		const length = delta.length();
 		if (length < 1e-6) return;
 		if (length > maxMove) delta.multiplyScalar(maxMove / length);
@@ -941,19 +1488,18 @@ export class KnotEngine {
 							const dist = Math.sqrt(contact.distSq);
 							if (!Number.isFinite(dist) || dist >= nearField) continue;
 
-							let nx = contact.dx;
-							let ny = contact.dy;
-							let nz = contact.dz;
-							let normalLength = Math.hypot(nx, ny, nz);
-							if (normalLength < 1e-7) {
-								nx = pointsA[a1] - pointsA[a0];
-								ny = pointsA[a1 + 1] - pointsA[a0 + 1];
-								nz = pointsA[a1 + 2] - pointsA[a0 + 2];
-								normalLength = Math.hypot(nx, ny, nz) || 1;
-							}
-							nx /= normalLength;
-							ny /= normalLength;
-							nz /= normalLength;
+				const normal = separationNormalFromComponentEdgePair(
+					pointsA,
+					edgeA,
+					edgeANext,
+					pointsB,
+					edgeB,
+					edgeBNext,
+					contact
+				);
+				const nx = normal[0];
+				const ny = normal[1];
+				const nz = normal[2];
 
 							let push = 0;
 							if (dist < clearance) {
@@ -969,46 +1515,46 @@ export class KnotEngine {
 							const b0Weight = 1 - contact.t;
 							const b1Weight = contact.t;
 
-								displaceComponentPoint(
-									pointsA,
-									edgeA,
-									nx * push * a0Weight,
-									ny * push * a0Weight,
-									nz * push * a0Weight,
-									dragSelection && dragSelection.componentIndex === componentA
-										? dragSelection.pointIndex
-										: null
-								);
-								displaceComponentPoint(
-									pointsA,
-									edgeANext,
-									nx * push * a1Weight,
-									ny * push * a1Weight,
-									nz * push * a1Weight,
-									dragSelection && dragSelection.componentIndex === componentA
-										? dragSelection.pointIndex
-										: null
-								);
-								displaceComponentPoint(
-									pointsB,
+							displaceComponentPoint(
+								pointsA,
+								edgeA,
+								nx * push * a0Weight,
+								ny * push * a0Weight,
+								nz * push * a0Weight,
+								dragSelection && dragSelection.componentIndex === componentA
+									? dragSelection.pointIndex
+									: null
+							);
+							displaceComponentPoint(
+								pointsA,
+								edgeANext,
+								nx * push * a1Weight,
+								ny * push * a1Weight,
+								nz * push * a1Weight,
+								dragSelection && dragSelection.componentIndex === componentA
+									? dragSelection.pointIndex
+									: null
+							);
+							displaceComponentPoint(
+								pointsB,
 								edgeB,
-									-nx * push * b0Weight,
-									-ny * push * b0Weight,
-									-nz * push * b0Weight,
-									dragSelection && dragSelection.componentIndex === componentB
-										? dragSelection.pointIndex
-										: null
-								);
-								displaceComponentPoint(
-									pointsB,
+								-nx * push * b0Weight,
+								-ny * push * b0Weight,
+								-nz * push * b0Weight,
+								dragSelection && dragSelection.componentIndex === componentB
+									? dragSelection.pointIndex
+									: null
+							);
+							displaceComponentPoint(
+								pointsB,
 								edgeBNext,
-									-nx * push * b1Weight,
-									-ny * push * b1Weight,
-									-nz * push * b1Weight,
-									dragSelection && dragSelection.componentIndex === componentB
-										? dragSelection.pointIndex
-										: null
-								);
+								-nx * push * b1Weight,
+								-ny * push * b1Weight,
+								-nz * push * b1Weight,
+								dragSelection && dragSelection.componentIndex === componentB
+									? dragSelection.pointIndex
+									: null
+							);
 						}
 					}
 				}
@@ -1016,7 +1562,7 @@ export class KnotEngine {
 
 			for (let componentIndex = 0; componentIndex < components.length; componentIndex += 1) {
 				const points = components[componentIndex];
-				const restLength = this.getComponentRestLength(componentIndex);
+				const restLength = this.getComponentConstraintLength(componentIndex);
 				const pinnedIndex =
 					dragSelection && dragSelection.componentIndex === componentIndex ? dragSelection.pointIndex : null;
 				projectComponentEdgeLengths(points, restLength, 8, pinnedIndex);
@@ -1034,12 +1580,12 @@ export class KnotEngine {
 			const pinnedIndex =
 				dragSelection && dragSelection.componentIndex === componentIndex ? dragSelection.pointIndex : null;
 			redistributeClosedCurveArclength(points, pinnedIndex);
-			const restLength = this.getComponentRestLength(componentIndex);
+			const restLength = this.getComponentConstraintLength(componentIndex);
 			projectComponentEdgeLengths(points, restLength, 3, pinnedIndex);
 		}
 	}
 
-	private recenterAllComponents(): void {
+	private recenterAllComponents(blend = 0.03): void {
 		const components: Float32Array[] = [];
 		if (this.points) components.push(this.points);
 		for (const component of this.passiveComponents) components.push(component);
@@ -1063,14 +1609,16 @@ export class KnotEngine {
 		cx /= count;
 		cy /= count;
 		cz /= count;
+		const clampedBlend = clampNumber(blend, 0, 1);
+		if (clampedBlend <= 0) return;
 
 		for (const points of components) {
 			const pointCount = points.length / 3;
 			for (let i = 0; i < pointCount; i += 1) {
 				const base = i * 3;
-				points[base] -= cx;
-				points[base + 1] -= cy;
-				points[base + 2] -= cz;
+				points[base] -= cx * clampedBlend;
+				points[base + 1] -= cy * clampedBlend;
+				points[base + 2] -= cz * clampedBlend;
 			}
 		}
 	}
@@ -1117,7 +1665,7 @@ export class KnotEngine {
 			const points = components[componentIndex];
 			const count = points.length / 3;
 			if (count < 2) continue;
-			const restLength = this.getComponentRestLength(componentIndex);
+			const restLength = this.getComponentConstraintLength(componentIndex);
 			const restTotal = restLength * count;
 			if (!Number.isFinite(restTotal) || restTotal <= 1e-9) continue;
 			let total = 0;
@@ -1185,6 +1733,7 @@ export class KnotEngine {
 		this.camera.near = Math.max(0.02, Math.min(0.25, far / 5000));
 		this.camera.far = far;
 		this.camera.updateProjectionMatrix();
+		this.updateGroundPlane(center, radius);
 		this.controls.update();
 	}
 
@@ -1212,9 +1761,6 @@ export class KnotEngine {
 
 		this.controls.minDistance = Math.max(2.2, radius * 0.7);
 		this.controls.maxDistance = Math.max(90, radius * 80);
-
-		// Keep target glued to the evolving knot center so orbit/zoom stay intuitive.
-		this.controls.target.lerp(center, 0.18);
 	}
 
 	private notifyStatus(message: string): void {
@@ -1589,8 +2135,112 @@ function closestPointsBetweenComponentEdges(
 	return { s, t, distSq: dx * dx + dy * dy + dz * dz, dx, dy, dz };
 }
 
+function separationNormalFromComponentEdgePair(
+	pointsA: Float32Array,
+	a0: number,
+	a1: number,
+	pointsB: Float32Array,
+	b0: number,
+	b1: number,
+	contact: ComponentSegmentContact
+): [number, number, number] {
+	let nx = contact.dx;
+	let ny = contact.dy;
+	let nz = contact.dz;
+	let len = Math.hypot(nx, ny, nz);
+	if (len > 1e-7) return [nx / len, ny / len, nz / len];
+
+	const a0b = a0 * 3;
+	const a1b = a1 * 3;
+	const b0b = b0 * 3;
+	const b1b = b1 * 3;
+	const ax = pointsA[a1b] - pointsA[a0b];
+	const ay = pointsA[a1b + 1] - pointsA[a0b + 1];
+	const az = pointsA[a1b + 2] - pointsA[a0b + 2];
+	const bx = pointsB[b1b] - pointsB[b0b];
+	const by = pointsB[b1b + 1] - pointsB[b0b + 1];
+	const bz = pointsB[b1b + 2] - pointsB[b0b + 2];
+
+	nx = ay * bz - az * by;
+	ny = az * bx - ax * bz;
+	nz = ax * by - ay * bx;
+	len = Math.hypot(nx, ny, nz);
+	if (len > 1e-7) return [nx / len, ny / len, nz / len];
+
+	const amx = (pointsA[a0b] + pointsA[a1b]) * 0.5;
+	const amy = (pointsA[a0b + 1] + pointsA[a1b + 1]) * 0.5;
+	const amz = (pointsA[a0b + 2] + pointsA[a1b + 2]) * 0.5;
+	const bmx = (pointsB[b0b] + pointsB[b1b]) * 0.5;
+	const bmy = (pointsB[b0b + 1] + pointsB[b1b + 1]) * 0.5;
+	const bmz = (pointsB[b0b + 2] + pointsB[b1b + 2]) * 0.5;
+	nx = amx - bmx;
+	ny = amy - bmy;
+	nz = amz - bmz;
+	len = Math.hypot(nx, ny, nz);
+	if (len > 1e-7) return [nx / len, ny / len, nz / len];
+
+	return orthogonalDirection(ax, ay, az);
+}
+
+function orthogonalDirection(x: number, y: number, z: number): [number, number, number] {
+	let ox: number;
+	let oy: number;
+	let oz: number;
+	if (Math.abs(x) <= Math.abs(y) && Math.abs(x) <= Math.abs(z)) {
+		ox = 0;
+		oy = -z;
+		oz = y;
+	} else if (Math.abs(y) <= Math.abs(x) && Math.abs(y) <= Math.abs(z)) {
+		ox = -z;
+		oy = 0;
+		oz = x;
+	} else {
+		ox = -y;
+		oy = x;
+		oz = 0;
+	}
+	let len = Math.hypot(ox, oy, oz);
+	if (len < 1e-8) {
+		ox = 1;
+		oy = 0;
+		oz = 0;
+		len = 1;
+	}
+	return [ox / len, oy / len, oz / len];
+}
+
 function dot3(ax: number, ay: number, az: number, bx: number, by: number, bz: number): number {
 	return ax * bx + ay * by + az * bz;
+}
+
+function presetTubeColor(preset: KnotMaterialPreset): string {
+	switch (preset) {
+		case 'glass':
+			return '#e8f6ff';
+		case 'liquid_metal':
+			return '#c8d2e2';
+		case 'energy_field':
+			return '#1f3367';
+		case 'vector_field':
+			return '#1f3b35';
+		default:
+			return TUBE_COLOR;
+	}
+}
+
+function presetLineColor(preset: KnotMaterialPreset): string {
+	switch (preset) {
+		case 'glass':
+			return '#d4f4ff';
+		case 'liquid_metal':
+			return '#d1e3ff';
+		case 'energy_field':
+			return '#79b6ff';
+		case 'vector_field':
+			return '#8df0d5';
+		default:
+			return LINE_COLOR;
+	}
 }
 
 function componentTubeColor(colorizeLinks: boolean, componentIndex: number): string {
@@ -1601,6 +2251,215 @@ function componentTubeColor(colorizeLinks: boolean, componentIndex: number): str
 function componentLineColor(colorizeLinks: boolean, componentIndex: number): string {
 	if (!colorizeLinks) return LINE_COLOR;
 	return COMPONENT_LINE_COLORS[componentIndex % COMPONENT_LINE_COLORS.length];
+}
+
+function modulo1(value: number): number {
+	const wrapped = value % 1;
+	return wrapped < 0 ? wrapped + 1 : wrapped;
+}
+
+function createCanvasTexture(
+	size: number,
+	draw: (context: CanvasRenderingContext2D, size: number) => void,
+	colorSpace: THREE.ColorSpace = THREE.SRGBColorSpace
+): THREE.CanvasTexture {
+	const canvas = document.createElement('canvas');
+	canvas.width = size;
+	canvas.height = size;
+	const context = canvas.getContext('2d');
+	if (!context) throw new Error('Unable to allocate 2D canvas for texture.');
+	draw(context, size);
+	const texture = new THREE.CanvasTexture(canvas);
+	texture.wrapS = THREE.RepeatWrapping;
+	texture.wrapT = THREE.RepeatWrapping;
+	texture.colorSpace = colorSpace;
+	texture.needsUpdate = true;
+	return texture;
+}
+
+function createPoincareDiskTexture(textureSize = 2048): THREE.CanvasTexture {
+	return createCanvasTexture(textureSize, (context, size) => {
+		const center = size * 0.5;
+		const radius = size * 0.4992;
+		const p = 7;
+		const q = 3;
+		const halfA = Math.PI / (2 * p);
+		const b = Math.PI / q;
+		const cosA = Math.cos(halfA);
+		const sinA = Math.sin(halfA);
+		const sinB = Math.sin(b);
+		const cosB = Math.cos(b);
+		const denominator = cosA * cosA - sinB * sinB;
+		const safeDenominator = Math.max(1e-6, denominator);
+		const circleCenterX = cosB / Math.sqrt(safeDenominator);
+		const circleRadius = Math.sqrt(Math.max(1e-6, circleCenterX * circleCenterX - 1));
+		const maxIterations = 72;
+		const image = context.createImageData(size, size);
+		const data = image.data;
+		const dark = [8, 8, 8];
+		const light = [244, 244, 244];
+
+		const reflectAcrossLine = (x: number, y: number, angle: number): [number, number] => {
+			const c = Math.cos(angle * 2);
+			const s = Math.sin(angle * 2);
+			return [c * x + s * y, s * x - c * y];
+		};
+
+		for (let y = 0; y < size; y += 1) {
+			for (let x = 0; x < size; x += 1) {
+				let nx = (x + 0.5 - center) / radius;
+				let ny = (y + 0.5 - center) / radius;
+				const r = Math.hypot(nx, ny);
+				const i = (y * size + x) * 4;
+				if (r >= 1) {
+					const scale = 0.999999 / Math.max(1e-6, r);
+					nx *= scale;
+					ny *= scale;
+				}
+
+				let px = nx;
+				let py = ny;
+				let reflections = 0;
+
+				for (let step = 0; step < maxIterations; step += 1) {
+					const lower = sinA * px + cosA * py;
+					const upper = -sinA * px + cosA * py;
+					const dx = px - circleCenterX;
+					const dy = py;
+					const insideCircle = dx * dx + dy * dy < circleRadius * circleRadius;
+
+					if (lower >= 0 && upper <= 0 && !insideCircle) break;
+
+					if (lower < 0) {
+						[px, py] = reflectAcrossLine(px, py, -halfA);
+						reflections += 1;
+						continue;
+					}
+					if (upper > 0) {
+						[px, py] = reflectAcrossLine(px, py, halfA);
+						reflections += 1;
+						continue;
+					}
+					if (insideCircle) {
+						const lenSq = Math.max(1e-8, dx * dx + dy * dy);
+						const scale = (circleRadius * circleRadius) / lenSq;
+						px = circleCenterX + dx * scale;
+						py = dy * scale;
+						reflections += 1;
+						continue;
+					}
+				}
+
+				const shade = reflections % 2 === 0 ? light : dark;
+				data[i] = shade[0];
+				data[i + 1] = shade[1];
+				data[i + 2] = shade[2];
+				data[i + 3] = 255;
+			}
+		}
+
+		context.putImageData(image, 0, 0);
+	});
+}
+
+function createBrushedMetalTexture(): THREE.CanvasTexture {
+	return createCanvasTexture(256, (context, size) => {
+		const gradient = context.createLinearGradient(0, 0, 0, size);
+		gradient.addColorStop(0, '#8893a6');
+		gradient.addColorStop(0.45, '#d8dee8');
+		gradient.addColorStop(1, '#7f8a9a');
+		context.fillStyle = gradient;
+		context.fillRect(0, 0, size, size);
+		for (let y = 0; y < size; y += 1) {
+			const jitter = 36 + Math.floor(Math.random() * 48);
+			context.fillStyle = `rgba(255, 255, 255, ${jitter / 1000})`;
+			context.fillRect(0, y, size, 1);
+		}
+		for (let i = 0; i < 1700; i += 1) {
+			const x = Math.floor(Math.random() * size);
+			const y = Math.floor(Math.random() * size);
+			const alpha = 0.03 + Math.random() * 0.04;
+			context.fillStyle = `rgba(0, 0, 0, ${alpha})`;
+			context.fillRect(x, y, 1, 2);
+		}
+	});
+}
+
+function createEnergyTexture(): THREE.CanvasTexture {
+	return createCanvasTexture(256, (context, size) => {
+		const gradient = context.createLinearGradient(0, 0, size, 0);
+		gradient.addColorStop(0, '#081a2e');
+		gradient.addColorStop(0.5, '#114470');
+		gradient.addColorStop(1, '#07121f');
+		context.fillStyle = gradient;
+		context.fillRect(0, 0, size, size);
+		context.globalCompositeOperation = 'lighter';
+		for (let band = 0; band < 14; band += 1) {
+			const y = ((band + 0.5) * size) / 14;
+			context.strokeStyle = `rgba(99, 205, 255, ${0.14 + (band % 3) * 0.06})`;
+			context.lineWidth = 3 + (band % 2) * 2;
+			context.beginPath();
+			for (let x = 0; x <= size; x += 8) {
+				const wave = Math.sin((x / size) * Math.PI * 4 + band * 0.73) * (4 + (band % 4));
+				if (x === 0) context.moveTo(x, y + wave);
+				else context.lineTo(x, y + wave);
+			}
+			context.stroke();
+		}
+		context.globalCompositeOperation = 'source-over';
+	});
+}
+
+function createVectorFieldTexture(): THREE.CanvasTexture {
+	return createCanvasTexture(256, (context, size) => {
+		context.fillStyle = '#102926';
+		context.fillRect(0, 0, size, size);
+		context.strokeStyle = 'rgba(132, 255, 222, 0.55)';
+		context.fillStyle = 'rgba(176, 255, 232, 0.78)';
+		context.lineWidth = 2;
+		const spacing = 32;
+		for (let y = spacing / 2; y < size; y += spacing) {
+			for (let x = spacing / 2; x < size; x += spacing) {
+				const angle = ((x + y) / size) * Math.PI * 1.35;
+				const len = 12;
+				const x2 = x + Math.cos(angle) * len;
+				const y2 = y + Math.sin(angle) * len;
+				context.beginPath();
+				context.moveTo(x, y);
+				context.lineTo(x2, y2);
+				context.stroke();
+
+				const head = 4;
+				const left = angle + Math.PI * 0.82;
+				const right = angle - Math.PI * 0.82;
+				context.beginPath();
+				context.moveTo(x2, y2);
+				context.lineTo(x2 + Math.cos(left) * head, y2 + Math.sin(left) * head);
+				context.lineTo(x2 + Math.cos(right) * head, y2 + Math.sin(right) * head);
+				context.closePath();
+				context.fill();
+			}
+		}
+	});
+}
+
+function createFrostedNormalTexture(): THREE.CanvasTexture {
+	return createCanvasTexture(
+		256,
+		(context, size) => {
+			const image = context.createImageData(size, size);
+			for (let i = 0; i < image.data.length; i += 4) {
+				const nx = Math.floor(128 + (Math.random() - 0.5) * 44);
+				const ny = Math.floor(128 + (Math.random() - 0.5) * 44);
+				image.data[i] = nx;
+				image.data[i + 1] = ny;
+				image.data[i + 2] = 255;
+				image.data[i + 3] = 255;
+			}
+			context.putImageData(image, 0, 0);
+		},
+		THREE.NoColorSpace
+	);
 }
 
 function clampInteger(value: number, min: number, max: number): number {

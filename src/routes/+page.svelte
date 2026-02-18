@@ -1,20 +1,35 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import { KnotEngine, type KnotMetrics } from '$lib/knot';
+	import { KnotEngine, type KnotMaterialPreset, type KnotMetrics } from '$lib/knot';
 
 	let viewport: HTMLDivElement | undefined;
 	let engine = $state<KnotEngine | null>(null);
 
-	let crossingTarget = $state(9);
+	let crossingTarget = $state(50);
 	let seed = $state(newSeed());
 	let autoRelax = $state(true);
 	let solidLink = $state(true);
-	let colorizeLinks = $state(false);
+	let colorizeLinks = $state(true);
 	let showControlPoints = $state(false);
 	let arcGuideLayout = $state(true);
 	let repulsionStrength = $state(1.0);
 	let smoothness = $state(0.62);
 	let relaxSpeed = $state(3);
+	let lengthTargetScale = $state(0.88);
+	let materialPreset = $state<KnotMaterialPreset>('liquid_metal');
+	let materialRoughness = $state(0.18);
+	let materialMetalness = $state(1);
+	let materialTransmission = $state(0);
+	let materialClearcoat = $state(0.88);
+	let materialEnvironment = $state(1.6);
+	let materialEmissive = $state(0.8);
+	let materialAnimationSpeed = $state(1.25);
+	let materialTextureScale = $state(1.65);
+	let renderExposure = $state(0.62);
+	let ambientLightIntensity = $state(0.12);
+	let keyLightIntensity = $state(1.3);
+	let fillLightIntensity = $state(0.06);
+	let rimLightIntensity = $state(0.42);
 	let generating = $state(false);
 	let status = $state('Preparing WebGPU renderer...');
 	let bootError = $state<string | null>(null);
@@ -22,7 +37,7 @@
 		preset: 'random_shadow',
 		label: 'Shadow',
 		crossings: 0,
-		targetCrossings: 9,
+		targetCrossings: 50,
 		energy: 0,
 		nodeCount: 0,
 		minClearance: Number.POSITIVE_INFINITY,
@@ -39,6 +54,66 @@
 
 	function showSolution(): void {
 		engine?.showSolution();
+	}
+
+	function applyMaterialPresetDefaults(preset: KnotMaterialPreset): void {
+		switch (preset) {
+			case 'rope': {
+				materialRoughness = 0.28;
+				materialMetalness = 0.08;
+				materialTransmission = 0;
+				materialClearcoat = 0.55;
+				materialEnvironment = 0.72;
+				materialEmissive = 1;
+				materialAnimationSpeed = 0.8;
+				materialTextureScale = 1.45;
+				break;
+			}
+			case 'glass': {
+				materialRoughness = 0.08;
+				materialMetalness = 0;
+				materialTransmission = 1;
+				materialClearcoat = 0.98;
+				materialEnvironment = 1.2;
+				materialEmissive = 0.9;
+				materialAnimationSpeed = 0.35;
+				materialTextureScale = 1.7;
+				break;
+			}
+			case 'liquid_metal': {
+				materialRoughness = 0.18;
+				materialMetalness = 1;
+				materialTransmission = 0;
+				materialClearcoat = 0.88;
+				materialEnvironment = 1.6;
+				materialEmissive = 0.8;
+				materialAnimationSpeed = 1.25;
+				materialTextureScale = 1.65;
+				break;
+			}
+			case 'energy_field': {
+				materialRoughness = 0.3;
+				materialMetalness = 0.22;
+				materialTransmission = 0.55;
+				materialClearcoat = 0.74;
+				materialEnvironment = 0.86;
+				materialEmissive = 1.9;
+				materialAnimationSpeed = 1.8;
+				materialTextureScale = 1.95;
+				break;
+			}
+			case 'vector_field': {
+				materialRoughness = 0.34;
+				materialMetalness = 0.26;
+				materialTransmission = 0.2;
+				materialClearcoat = 0.72;
+				materialEnvironment = 0.82;
+				materialEmissive = 1.5;
+				materialAnimationSpeed = 1.45;
+				materialTextureScale = 2.2;
+				break;
+			}
+		}
 	}
 
 	async function generateChallenge(randomizeSeed: boolean): Promise<void> {
@@ -93,6 +168,36 @@
 		if (engine) engine.setRelaxIterations(relaxSpeed);
 	});
 
+	$effect(() => {
+		if (engine) engine.setLengthTargetScale(lengthTargetScale);
+	});
+
+	$effect(() => {
+		if (!engine) return;
+		engine.setMaterialSettings({
+			preset: materialPreset,
+			roughness: materialRoughness,
+			metalness: materialMetalness,
+			transmission: materialTransmission,
+			clearcoat: materialClearcoat,
+			envMapIntensity: materialEnvironment,
+			emissiveIntensity: materialEmissive,
+			animationSpeed: materialAnimationSpeed,
+			textureScale: materialTextureScale
+		});
+	});
+
+	$effect(() => {
+		if (!engine) return;
+		engine.setLightingSettings({
+			exposure: renderExposure,
+			ambientIntensity: ambientLightIntensity,
+			keyIntensity: keyLightIntensity,
+			fillIntensity: fillLightIntensity,
+			rimIntensity: rimLightIntensity
+		});
+	});
+
 	onMount(() => {
 		const container = viewport;
 		if (!container) return;
@@ -116,10 +221,29 @@
 				engine.setColorizeLinks(colorizeLinks);
 				engine.setShowControlPoints(showControlPoints);
 				engine.setArcGuideLayout(arcGuideLayout);
-				engine.setRepulsionStrength(repulsionStrength);
-				engine.setRelaxSmoothness(smoothness);
-				engine.setRelaxIterations(relaxSpeed);
-				await generateChallenge(false);
+					engine.setRepulsionStrength(repulsionStrength);
+					engine.setRelaxSmoothness(smoothness);
+					engine.setRelaxIterations(relaxSpeed);
+					engine.setLengthTargetScale(lengthTargetScale);
+					engine.setMaterialSettings({
+						preset: materialPreset,
+						roughness: materialRoughness,
+						metalness: materialMetalness,
+						transmission: materialTransmission,
+						clearcoat: materialClearcoat,
+						envMapIntensity: materialEnvironment,
+						emissiveIntensity: materialEmissive,
+						animationSpeed: materialAnimationSpeed,
+						textureScale: materialTextureScale
+					});
+					engine.setLightingSettings({
+						exposure: renderExposure,
+						ambientIntensity: ambientLightIntensity,
+						keyIntensity: keyLightIntensity,
+						fillIntensity: fillLightIntensity,
+						rimIntensity: rimLightIntensity
+					});
+					await generateChallenge(false);
 				status = 'Drag the knot and reduce crossings toward the target.';
 			} catch (error) {
 				bootError =
@@ -193,9 +317,96 @@
 				<input type="range" min="1" max="8" step="1" bind:value={relaxSpeed} />
 			</label>
 
-			<div class="actions">
-				<button onclick={() => generateChallenge(false)} disabled={!engine || generating}>
-					{generating ? 'Generating...' : 'Generate'}
+				<label>
+					Tension (target length): {lengthTargetScale.toFixed(2)}
+					<input type="range" min="0.6" max="1.05" step="0.01" bind:value={lengthTargetScale} />
+				</label>
+
+				<section class="material-lab">
+					<h3>Material Lab</h3>
+						<label>
+							Material preset
+							<select
+								bind:value={materialPreset}
+								onchange={() => applyMaterialPresetDefaults(materialPreset)}
+							>
+								<option value="rope">Classic rope</option>
+								<option value="glass">Glass</option>
+								<option value="liquid_metal">Shiny metal</option>
+							<option value="energy_field">Energy field</option>
+							<option value="vector_field">Vector field</option>
+						</select>
+					</label>
+
+					<label>
+						Roughness: {materialRoughness.toFixed(2)}
+						<input type="range" min="0.02" max="1" step="0.01" bind:value={materialRoughness} />
+					</label>
+
+					<label>
+						Metalness: {materialMetalness.toFixed(2)}
+						<input type="range" min="0" max="1" step="0.01" bind:value={materialMetalness} />
+					</label>
+
+					<label>
+						Transmission: {materialTransmission.toFixed(2)}
+						<input type="range" min="0" max="1" step="0.01" bind:value={materialTransmission} />
+					</label>
+
+					<label>
+						Clearcoat: {materialClearcoat.toFixed(2)}
+						<input type="range" min="0" max="1" step="0.01" bind:value={materialClearcoat} />
+					</label>
+
+					<label>
+						Environment reflections: {materialEnvironment.toFixed(2)}
+						<input type="range" min="0" max="3" step="0.05" bind:value={materialEnvironment} />
+					</label>
+
+					<label>
+						Emissive boost: {materialEmissive.toFixed(2)}
+						<input type="range" min="0" max="4" step="0.05" bind:value={materialEmissive} />
+					</label>
+
+					<label>
+						Flow speed: {materialAnimationSpeed.toFixed(2)}
+						<input type="range" min="0" max="6" step="0.05" bind:value={materialAnimationSpeed} />
+					</label>
+
+					<label>
+						Texture scale: {materialTextureScale.toFixed(2)}
+						<input type="range" min="0.2" max="8" step="0.05" bind:value={materialTextureScale} />
+					</label>
+
+					<label>
+						Exposure: {renderExposure.toFixed(2)}
+						<input type="range" min="0.5" max="2.7" step="0.05" bind:value={renderExposure} />
+					</label>
+
+					<label>
+						Ambient light: {ambientLightIntensity.toFixed(2)}
+						<input type="range" min="0" max="2.4" step="0.05" bind:value={ambientLightIntensity} />
+					</label>
+
+					<label>
+						Key light: {keyLightIntensity.toFixed(2)}
+						<input type="range" min="0" max="4" step="0.05" bind:value={keyLightIntensity} />
+					</label>
+
+					<label>
+						Fill light: {fillLightIntensity.toFixed(2)}
+						<input type="range" min="0" max="3" step="0.05" bind:value={fillLightIntensity} />
+					</label>
+
+					<label>
+						Rim light: {rimLightIntensity.toFixed(2)}
+						<input type="range" min="0" max="3" step="0.05" bind:value={rimLightIntensity} />
+					</label>
+				</section>
+
+				<div class="actions">
+					<button onclick={() => generateChallenge(false)} disabled={!engine || generating}>
+						{generating ? 'Generating...' : 'Generate'}
 				</button>
 				<button onclick={() => generateChallenge(true)} disabled={!engine || generating}>
 					New seed + generate
@@ -258,6 +469,8 @@
 <style>
 	:global(body) {
 		margin: 0;
+		height: 100svh;
+		overflow: hidden;
 		font-family: 'Trebuchet MS', 'Segoe UI', sans-serif;
 		color: #f3f7ec;
 		background:
@@ -267,12 +480,13 @@
 	}
 
 	.page {
-		min-height: 100vh;
+		height: 100svh;
 		padding: 1rem;
 		display: grid;
 		grid-template-columns: minmax(18rem, 23rem) 1fr;
 		gap: 1rem;
 		box-sizing: border-box;
+		overflow: hidden;
 	}
 
 	.panel {
@@ -284,6 +498,8 @@
 		display: flex;
 		flex-direction: column;
 		gap: 1rem;
+		min-height: 0;
+		overflow: auto;
 	}
 
 	h1 {
@@ -313,11 +529,13 @@
 
 	input[type='number'],
 	input[type='range'],
+	select,
 	button {
 		font-family: inherit;
 	}
 
-	input[type='number'] {
+	input[type='number'],
+	select {
 		background: rgba(8, 31, 27, 0.88);
 		color: #f3f7ec;
 		border: 1px solid rgba(117, 239, 211, 0.34);
@@ -345,6 +563,21 @@
 		display: grid;
 		grid-template-columns: 1fr 1fr;
 		gap: 0.45rem;
+	}
+
+	.material-lab {
+		display: grid;
+		gap: 0.62rem;
+		padding: 0.72rem;
+		border-radius: 0.72rem;
+		background: rgba(7, 27, 24, 0.62);
+		border: 1px solid rgba(118, 239, 214, 0.18);
+	}
+
+	.material-lab h3 {
+		margin: 0;
+		font-size: 0.92rem;
+		letter-spacing: 0.01em;
 	}
 
 	button {
@@ -410,13 +643,14 @@
 		border: 1px solid rgba(116, 244, 215, 0.2);
 		overflow: hidden;
 		background: linear-gradient(180deg, rgba(6, 19, 17, 0.66), rgba(4, 9, 8, 0.92));
-		min-height: 28rem;
+		height: 100%;
+		min-height: 0;
 	}
 
 	.viewport {
 		width: 100%;
 		height: 100%;
-		min-height: 28rem;
+		min-height: 0;
 	}
 
 	.overlay {
@@ -442,14 +676,27 @@
 	}
 
 	@media (max-width: 980px) {
+		:global(body) {
+			height: auto;
+			overflow: auto;
+		}
+
 		.page {
+			height: auto;
+			min-height: 100svh;
 			grid-template-columns: 1fr;
 			padding: 0.75rem;
+			overflow: visible;
+		}
+
+		.panel {
+			overflow: visible;
 		}
 
 		.viewport-shell,
 		.viewport {
 			min-height: 24rem;
+			height: 24rem;
 		}
 	}
 </style>
